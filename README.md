@@ -1,6 +1,5 @@
 # DOMAIN + SSL status checker
 
-## Screenshots
 
 ### SSL Certificates
 ![SSL Certificates](images/ssl-certificates.png)
