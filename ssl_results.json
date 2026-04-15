@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-14 01:07 UTC",
+  "generated_at": "2026-04-15 01:06 UTC",
   "total_domains": 10,
   "valid": 10,
   "expired": 0,
@@ -9,31 +9,21 @@
       "domain": "facebook.com",
       "status": "valid",
       "provider": "DigiCert",
-      "issued_on": "2026-01-21",
-      "expires_on": "2026-04-21",
+      "issued_on": "2026-01-22",
+      "expires_on": "2026-04-22",
       "days_left": 7,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "instagram.com",
       "status": "valid",
       "provider": "DigiCert",
-      "issued_on": "2026-01-21",
-      "expires_on": "2026-04-21",
+      "issued_on": "2026-01-22",
+      "expires_on": "2026-04-22",
       "days_left": 7,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
-    },
-    {
-      "domain": "wikipedia.org",
-      "status": "valid",
-      "provider": "Let's Encrypt",
-      "issued_on": "2026-02-06",
-      "expires_on": "2026-05-07",
-      "days_left": 23,
-      "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "google.com",
@@ -41,9 +31,9 @@
       "provider": "Cloudflare SSL",
       "issued_on": "2026-03-23",
       "expires_on": "2026-06-15",
-      "days_left": 62,
+      "days_left": 61,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "youtube.com",
@@ -51,9 +41,9 @@
       "provider": "Cloudflare SSL",
       "issued_on": "2026-03-23",
       "expires_on": "2026-06-15",
-      "days_left": 62,
+      "days_left": 61,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "twitter.com",
@@ -61,9 +51,19 @@
       "provider": "Let's Encrypt",
       "issued_on": "2026-03-30",
       "expires_on": "2026-06-28",
-      "days_left": 75,
+      "days_left": 74,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
+    },
+    {
+      "domain": "wikipedia.org",
+      "status": "valid",
+      "provider": "Let's Encrypt",
+      "issued_on": "2026-04-07",
+      "expires_on": "2026-07-06",
+      "days_left": 82,
+      "error": null,
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "linkedin.com",
@@ -71,9 +71,9 @@
       "provider": "DigiCert",
       "issued_on": "2026-03-19",
       "expires_on": "2026-09-19",
-      "days_left": 158,
+      "days_left": 157,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "reddit.com",
@@ -81,9 +81,9 @@
       "provider": "DigiCert",
       "issued_on": "2026-04-08",
       "expires_on": "2026-10-04",
-      "days_left": 173,
+      "days_left": 172,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "amazon.com",
@@ -91,9 +91,9 @@
       "provider": "DigiCert",
       "issued_on": "2026-02-02",
       "expires_on": "2027-01-23",
-      "days_left": 284,
+      "days_left": 283,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     },
     {
       "domain": "netflix.com",
@@ -101,9 +101,9 @@
       "provider": "DigiCert",
       "issued_on": "2026-02-18",
       "expires_on": "2027-02-18",
-      "days_left": 310,
+      "days_left": 309,
       "error": null,
-      "checked_at": "2026-04-14 01:07 UTC"
+      "checked_at": "2026-04-15 01:06 UTC"
     }
   ]
 }
