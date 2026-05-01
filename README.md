@@ -2,10 +2,13 @@
 
 
 ### SSL Certificates
-![SSL Certificates](images/ssl-certificates.png)
+![SSL Certificates](images/quickshot-2026-05-01-09-16-19.png)
 
 ### Domain Registrations
-![Domain Registrations](images/domain-registrations.png)
+![Domain Registrations](images/quickshot-2026-05-01-09-16-24.png)
+
+### Dashboard — Dark Mode
+![Dashboard Dark Mode](images/quickshot-2026-05-01-09-17-23.png)
 
 ---
 
