@@ -39,7 +39,7 @@
       --yellow:  #d97706;
       --orange:  #ea6c0a;
       --red:     #dc2626;
-      --blue:    #6366f1;
+      --blue:    #4f46e5;
       --purple:  #8b5cf6;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -60,7 +60,7 @@
 
     /* ── THEME TOGGLE ── */
     .theme-toggle {
-      height: 32px; padding: 0 12px; border-radius: 12px;
+      height: 32px; padding: 0 16px; border-radius: 12px;
       border: 1px solid var(--border); background: var(--bg2);
       color: var(--muted); cursor: pointer;
       display: flex; align-items: center; gap: 8px;
@@ -257,7 +257,7 @@
       .site-footer { padding: 20px 16px 18px; }
     }
     @media (max-width: 480px) {
-      .stats-row { grid-template-columns: repeat(2,1fr); }
+      .stats-row { grid-template-columns: 1fr; }
       /* Switch to short tab labels on small screens */
       .nav-tab { font-size: 0.75rem; padding: 0 10px; }
       .nav-tab-long { display: none; }
@@ -269,7 +269,7 @@
       .ssl-col-issued, .ssl-col-provider { display: none; }
       .dom-col-registrar { display: none; }
       /* Allow wrapping so nothing causes horizontal scroll */
-      td, th { padding: 7px 8px; font-size: 0.76rem; white-space: normal; }
+      td, th { padding: 8px; font-size: 0.72rem; white-space: normal; }
       td.dom { white-space: normal; word-break: break-all; }
       /* Drop progress bar, keep day count only */
       .bar { display: none; }
