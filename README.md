@@ -354,20 +354,24 @@ at-least-once delivery and CI inputs — is in
 
 ## GitHub Actions Automation
 
-`.github/workflows/ssl-check.yml` runs the checks and publishes the dashboard to
-Cloudflare Pages. It is the only deployment path; nothing is deployed by hand.
+`.github/workflows/ssl-check.yml` is the single workflow that runs the checks
+and deploys to Cloudflare Pages, for both production and previews. Nothing is
+deployed by hand. The only other workflows are the reusable, secret-free
+`verify.yml` and the PR-only `pr-verify.yml`.
 
 ### Triggers
 
 | Trigger | What runs |
 |---|---|
 | `pull_request` | `pr-verify.yml` calls the reusable offline checks. A pull request never publishes, needs no secrets, and makes no external probes. |
-| `push` to `main` | `ssl-check.yml` runs the same offline checks, then the certificate checks and a publish. Only for files that affect the checks, the dashboard or the published bundle. |
+| `push` to `main` | `ssl-check.yml` runs the same offline checks, then the certificate checks and a production publish. Only for files that affect the checks, the dashboard or the published bundle. |
+| `push` to `dev`, `develop`, `development` or `development/**` | The same offline checks, then the certificate checks and a preview publish. No other branch, tag or pull request deploys. |
 | `schedule` | Every day at **06:00 Asia/Colombo (UTC+5:30)**, i.e. **00:30 UTC**. |
-| `workflow_dispatch` | Manual run from the GitHub Actions tab. Publishes only from `main`. |
+| `workflow_dispatch` | Manual run from the GitHub Actions tab. Publishes production from `main` only; it never deploys a preview. |
 
-Superseded pull-request runs are cancelled. A run on `main` is never cancelled
-mid-publish: a second one waits behind it (`concurrency: certiwatch-${{ github.ref }}`).
+Superseded preview runs on a development branch are cancelled. A run on `main`
+is never cancelled mid-publish: a second one waits behind it
+(`concurrency: certiwatch-${{ github.ref }}`).
 
 ### Automated checks
 
@@ -387,15 +391,15 @@ verified on a fork. Pull requests do not run either checker, do not restore the
 history cache, do not touch the KV namespace and cannot deploy.
 
 The checks live in the reusable, no-secret `verify.yml`. A dedicated
-`pr-verify.yml` calls it on every pull request, and the production workflow
-calls the same reusable job as its `publish` dependency. The split means PR
-verification can run even when the production workflow has been disabled for
+`pr-verify.yml` calls it on every pull request, and both the production and
+preview jobs call it as their `needs: verify` dependency. The split means PR
+verification can run even when the publish workflow has been disabled for
 repository inactivity; the PR workflow has no secrets and no publish path.
 
-The publish job declares `needs: verify` and runs only for
-`github.ref == 'refs/heads/main'`, so a `main` run - push, schedule or manual -
-cannot deploy unless every check passes first. A feature-branch dispatch is
-skipped rather than writing state or publishing.
+The production job runs only for `github.ref == 'refs/heads/main'`, so a `main`
+run - push, schedule or manual - cannot deploy unless every check passes first.
+The preview job runs only for a `push` to one of the named development branches;
+a manual dispatch is skipped rather than publishing.
 
 ### What a publishing run does
 
@@ -420,6 +424,49 @@ skipped rather than writing state or publishing.
 
 It does **not** commit the results back to `main`; see
 [Generated data and Git](#generated-data-and-git).
+
+### What a preview run does
+
+A preview is a real deploy of the checked development branch, kept separate
+from production state:
+
+1. Fails closed unless the `certiwatch-preview` environment provides both
+   preview secrets. It never falls back to the production token.
+2. Validates `certiwatch.toml` and runs the SSL and domain checkers.
+3. Builds `dist/` with `scripts/build_dist.py`. No history is restored and
+   `monitor_state.py` is never run, so the bundle has no public history.
+4. Deploys `dist/` to the same Pages project on a preview branch. The production
+   deployment and its hostname are untouched.
+
+The preview job never reads or writes the production `history.json`, the KV
+alert checkpoint, or the Discord transport. It has no access to
+`CLOUDFLARE_API_TOKEN`, `CERTIWATCH_STATE_KV_TOKEN` or
+`CERTIWATCH_DISCORD_WEBHOOK`; it only sees the environment-scoped
+`CLOUDFLARE_PREVIEW_*` values.
+
+A preview branch alias is derived from the ref with an allowlist: lowercased,
+`/` and other separators become `-`, only `a-z`, `0-9`, `.`, `_` and `-` survive,
+and the result is capped at 48 characters. For example `development/api` deploys
+as `development-api`, reachable at
+`https://development-api.certiwatch.pages.dev` (or the configured preview
+project). The alias and project are validated before they are interpolated into
+the deploy command, so a branch name or repository variable cannot add command
+arguments.
+
+The same path filter as production applies: a preview deploys when a push to a
+development branch changes the checks, configuration, dashboard or bundle
+inputs. A docs-only push does not redeploy.
+
+### Removed workflow
+
+`release.yml` (Auto Release Notes) was removed. It ran an unrelated third-party
+action on `release: created` with `contents: write`, and used a hosted model to
+rewrite release notes. Release-note wording belongs to the Technical Writer and
+release state to the Issue & Release Coordinator, neither of which needs a
+write-scoped token in this repository. Removing it also drops an unnecessary
+third-party Actions dependency. GitHub may continue to list `Auto Release Notes`
+in the Actions tab until the deletion lands on the default branch; it cannot run
+once the file is gone.
 
 ### Publish safety rules
 
@@ -546,7 +593,8 @@ Pages bundle, an Actions cache or an uploaded artifact.
 
 ### Required GitHub configuration
 
-Add these under **Settings → Secrets and variables → Actions**:
+Production uses repository-scoped values under
+**Settings → Secrets and variables → Actions → Repository secrets/variables**:
 
 | Name | Kind | Description |
 |---|---|---|
@@ -565,10 +613,42 @@ namespace. The workflow writes the key `certiwatch-alert-state`; it does not
 list or read any other key. If the KV variables are absent, the workflow skips
 both KV steps and runs with `--transport none`.
 
-The deploy step is pinned to the verified `cloudflare/wrangler-action` release
-`v3.15.0` commit (`9acf94a…`) instead of a moving major tag, so a retagged or
-compromised tag cannot change what runs with the API token. `checkout` runs with
-`persist-credentials: false`; no step pushes to Git.
+#### Preview environment
+
+Create an environment named `certiwatch-preview` under
+**Settings → Environments** and add these to that environment only:
+
+| Name | Kind | Description |
+|---|---|---|
+| `CLOUDFLARE_PREVIEW_API_TOKEN` | environment secret | Pages edit token used for preview deployments |
+| `CLOUDFLARE_PREVIEW_ACCOUNT_ID` | environment secret | Cloudflare account ID for previews |
+| `CLOUDFLARE_PREVIEW_PROJECT` | environment variable, optional | Pages project for previews; defaults to `certiwatch` |
+
+Under the environment's **Deployment branches and tags**, choose **Selected
+branches and tags** and allow `dev`, `develop`, `development` and
+`development/*`. That policy means the environment's credentials are released
+only to those branches even if the workflow file is changed elsewhere. Required
+reviewers are optional but recommended for the environment.
+
+The preview job checks for both preview secrets before it probes or deploys and
+fails if either is missing. It never falls back to the repository-level
+production secrets. Scope the preview token to the Cloudflare account and Pages
+project that should receive previews; a Pages:Edit token used only by this
+environment is enough.
+
+Rotate a Pages credential by issuing a new Cloudflare API token with Pages edit
+permission, updating the matching GitHub secret, and revoking the old token.
+Credentials belong only in the GitHub secret store: never commit them, paste
+them into an issue or workflow log, or pass them through a repository variable.
+A token disclosed anywhere else should be revoked and replaced rather than
+reused. No DNS challenge credential is used or needed: deployment goes through
+the Cloudflare Pages API and the workflow never edits DNS records.
+
+All actions are pinned to full commit SHAs: `actions/checkout` v4,
+`actions/setup-python` v5, `actions/setup-node` v4, `actions/cache` v4, and the
+verified `cloudflare/wrangler-action` release `v3.15.0` commit (`9acf94a…`).
+A retagged or compromised tag therefore cannot change what runs with an API
+token. `checkout` runs with `persist-credentials: false`; no step pushes to Git.
 
 ### Live Dashboard
 
@@ -600,12 +680,22 @@ as `disabled_inactivity`; a push does not necessarily re-enable it. Open
 **Actions → CertiWatch checks** and choose **Enable workflow**, then run it once
 manually and check the result files' `generated_at` values.
 
-At the time of this change, the repository's production workflow is in exactly
-that state: the last run was **2026-08-31** and the workflow API reports
-`state: disabled_inactivity`. This is a repository setting, not a YAML or
-path-filter failure; enabling it requires repository admin access and was not
-done here. The separate `pr-verify.yml` workflow is not the disabled workflow,
-so PR checks can still run without enabling production or supplying secrets.
+On **2026-11-21** the Actions API reported all existing workflows as `active`;
+none was `disabled_inactivity` or `disabled_manually`. No workflow was enabled,
+disabled or dispatched while making this change. When this change lands:
+
+1. Review the new `ssl-check.yml` in the Actions tab and confirm the trigger
+   list shows `main`, `dev`, `develop`, `development` and `development/**`.
+2. Confirm `Auto Release Notes` disappears from the workflow list after the
+   deletion reaches the default branch. If it still appears, it is the stale
+   entry for a file that no longer exists; it cannot run.
+3. Do not enable or dispatch production to verify the YAML. The next qualifying
+   push, or the daily schedule, exercises it; the first preview needs a push to
+   one of the allowed development branches and the `certiwatch-preview`
+   environment configured first.
+
+The separate `pr-verify.yml` workflow is independent of the publish job, so PR
+checks can still run without enabling production or supplying secrets.
 
 ### Rollback
 
