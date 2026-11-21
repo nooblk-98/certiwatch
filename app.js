@@ -7,6 +7,8 @@
 
   var STALE_MS = 36 * 60 * 60 * 1000;
   var FETCH_TIMEOUT_MS = 15000;
+  var HISTORY_FILE = "history.json";
+  var HISTORY_WINDOW_DAYS = 30;
   var DEFAULT_SORT = "days_asc";
   var THEME_KEY = "certiwatch-theme";
   var FUTURE_SKEW_MS = 60 * 1000;
@@ -46,6 +48,23 @@
       if (!Number.isInteger(port) || port < 1 || port > 65535) return "";
     }
     return text;
+  }
+
+  /** Optional free-form labels on a result row; deduplicated and bounded. */
+  function cleanTags(value) {
+    if (!Array.isArray(value)) return [];
+    var seen = Object.create(null);
+    var tags = [];
+    value.forEach(function (item) {
+      if (typeof item !== "string" && typeof item !== "number") return;
+      var tag = cleanString(item, 40);
+      if (!tag) return;
+      var key = tag.toLowerCase();
+      if (seen[key]) return;
+      seen[key] = true;
+      tags.push(tag);
+    });
+    return tags.slice(0, 20);
   }
 
   function toNumberOrNull(value) {
@@ -216,6 +235,8 @@
       not_after: cleanString(value.not_after, 40),
       error: cleanString(value.error, 400),
       checked_at: cleanString(value.checked_at, 80),
+      tags: cleanTags(value.tags),
+      group: cleanString(value.group, 60),
       raw: value
     };
     ["provider", "issued_on", "expires_on", "not_before", "not_after", "error", "checked_at"].forEach(function (key) {
@@ -268,6 +289,8 @@
       purchase_date: cleanString(value.purchase_date, 40),
       expiry_date: cleanString(value.expiry_date, 40),
       days_left: toNumberOrNull(value.days_left),
+      tags: cleanTags(value.tags),
+      group: cleanString(value.group, 60),
       raw: value
     };
     ["registrar", "purchase_date", "expiry_date"].forEach(function (key) {
@@ -305,7 +328,8 @@
       : "";
     return [
       row.domain, row.provider, row.registrar, row.status,
-      row.port == null ? "" : row.port, row.error, fallback
+      row.port == null ? "" : row.port, row.error, fallback,
+      (row.tags || []).join(" "), row.group
     ].join(" ").toLowerCase();
   }
 
@@ -329,6 +353,214 @@
     if (filter === "expired") return category === "expired";
     if (filter === "unknown") return category === "unknown";
     return false;
+  }
+
+  /** Optional tags and group are filters over the loaded rows, not backend contracts. */
+  function matchesScope(row, tag, group) {
+    var wantedTag = String(tag || "").trim().toLowerCase();
+    var wantedGroup = String(group || "").trim().toLowerCase();
+    if (wantedTag) {
+      var tags = row.tags || [];
+      var found = tags.some(function (value) {
+        return String(value).toLowerCase() === wantedTag;
+      });
+      if (!found) return false;
+    }
+    if (wantedGroup && String(row.group || "").toLowerCase() !== wantedGroup) return false;
+    return true;
+  }
+
+  function scopeValue(tag, group) {
+    if (tag) return "tag:" + tag;
+    if (group) return "group:" + group;
+    return "";
+  }
+
+  function parseScopeValue(value) {
+    var text = String(value == null ? "" : value);
+    if (text.indexOf("tag:") === 0) return { tag: text.slice(4).trim(), group: "" };
+    if (text.indexOf("group:") === 0) return { tag: "", group: text.slice(6).trim() };
+    return { tag: "", group: "" };
+  }
+
+  function collectScopes(rows) {
+    var tagCounts = Object.create(null);
+    var groupCounts = Object.create(null);
+    (rows || []).forEach(function (row) {
+      (row.tags || []).forEach(function (tag) {
+        if (!tag) return;
+        tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+      });
+      if (row.group) groupCounts[row.group] = (groupCounts[row.group] || 0) + 1;
+    });
+    function list(counts) {
+      return Object.keys(counts).sort(function (a, b) {
+        return a.localeCompare(b, undefined, { sensitivity: "base" });
+      }).map(function (name) { return { name: name, count: counts[name] }; });
+    }
+    return { tags: list(tagCounts), groups: list(groupCounts) };
+  }
+
+  /** Provider / registrar mix; missing values are kept as an honest bucket. */
+  function summarizeBy(rows, field, limit) {
+    var max = typeof limit === "number" && limit > 0 ? limit : 6;
+    var counts = Object.create(null);
+    var order = [];
+    (rows || []).forEach(function (row) {
+      var raw = cleanString(row && row[field], 120);
+      var name = raw || "Not recorded";
+      if (!Object.prototype.hasOwnProperty.call(counts, name)) {
+        counts[name] = 0;
+        order.push(name);
+      }
+      counts[name] += 1;
+    });
+    var total = order.reduce(function (sum, name) { return sum + counts[name]; }, 0);
+    var buckets = order.map(function (name) {
+      return { name: name, count: counts[name] };
+    }).sort(function (a, b) {
+      if (a.name === "Not recorded") return 1;
+      if (b.name === "Not recorded") return -1;
+      return (b.count - a.count) || a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    });
+    if (buckets.length > max) {
+      var shown = buckets.slice(0, max);
+      var other = buckets.slice(max).reduce(function (sum, bucket) { return sum + bucket.count; }, 0);
+      shown.push({ name: "Other", count: other, other: true });
+      buckets = shown;
+    }
+    buckets.forEach(function (bucket) {
+      bucket.share = total > 0 ? bucket.count / total : 0;
+    });
+    return { total: total, distinct: order.length, buckets: buckets };
+  }
+
+  /** Header clicks use the same sort values as the select and the URL hash. */
+  function nextSortValue(current, ascending, descending) {
+    if (current === ascending && descending) return descending;
+    return ascending;
+  }
+
+  function cleanHistoryDate(value) {
+    var text = cleanString(value, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "";
+  }
+
+  function normalizeHistoryItem(key, value) {
+    if (!isPlainObject(value)) return null;
+    var domain = cleanDomain(value.domain);
+    if (!domain) return null;
+    var row = {
+      domain: domain,
+      days_left: toNumberOrNull(value.days_left),
+      status: cleanString(value.status, 40).toLowerCase()
+    };
+    if (key === "ssl") row.fingerprint_sha256 = cleanString(value.fingerprint_sha256, 128).toLowerCase();
+    return row;
+  }
+
+  /** Parse the optional history file without letting it affect the live results. */
+  function normalizeHistory(json) {
+    if (!isPlainObject(json)) return { ok: false, reason: "the top level is not a JSON object", snapshots: [] };
+    if (!Array.isArray(json.snapshots)) return { ok: false, reason: "the snapshots list is missing", snapshots: [] };
+    if (!json.snapshots.length) return { ok: true, snapshots: [], skipped: 0 };
+    var snapshots = [];
+    var skipped = 0;
+    json.snapshots.forEach(function (item) {
+      if (!isPlainObject(item)) { skipped += 1; return; }
+      var date = cleanHistoryDate(item.date);
+      if (!date) { skipped += 1; return; }
+      function list(key, value) {
+        if (!Array.isArray(value)) return [];
+        return value.map(function (entry) { return normalizeHistoryItem(key, entry); }).filter(Boolean);
+      }
+      snapshots.push({ date: date, ssl: list("ssl", item.ssl), domains: list("domain", item.domains) });
+    });
+    snapshots.sort(function (a, b) { return a.date.localeCompare(b.date); });
+    var deduped = [];
+    snapshots.forEach(function (snapshot) {
+      if (deduped.length && deduped[deduped.length - 1].date === snapshot.date) {
+        deduped[deduped.length - 1] = snapshot;
+      } else {
+        deduped.push(snapshot);
+      }
+    });
+    if (!deduped.length) {
+      return { ok: false, reason: "no snapshot had a valid date", snapshots: [], skipped: skipped };
+    }
+    return { ok: true, snapshots: deduped, skipped: skipped };
+  }
+
+  function historyRows(snapshot, key) {
+    if (!snapshot) return [];
+    return (key === "ssl" ? snapshot.ssl : snapshot.domains) || [];
+  }
+
+  /** Per-snapshot counts plus renewal dates (days left rose or the certificate changed). */
+  function buildHistorySeries(key, snapshots) {
+    var points = [];
+    var renewals = [];
+    var previous = null;
+    (snapshots || []).forEach(function (snapshot) {
+      var rows = historyRows(snapshot, key);
+      var byDomain = Object.create(null);
+      var dueSoon = 0;
+      var expired = 0;
+      var unknown = 0;
+      rows.forEach(function (row) {
+        byDomain[row.domain] = row;
+        if (row.days_left == null) unknown += 1;
+        else if (row.days_left < 0 || row.status === "expired") expired += 1;
+        else if (row.days_left <= HISTORY_WINDOW_DAYS) dueSoon += 1;
+      });
+      points.push({ date: snapshot.date, total: rows.length, dueSoon: dueSoon, expired: expired, unknown: unknown });
+      if (previous) {
+        var renewed = [];
+        rows.forEach(function (row) {
+          var before = previous[row.domain];
+          if (!before) return;
+          var daysJumped = row.days_left != null && before.days_left != null && row.days_left > before.days_left;
+          var certificateChanged = key === "ssl" && row.fingerprint_sha256 && before.fingerprint_sha256 &&
+            row.fingerprint_sha256 !== before.fingerprint_sha256;
+          if (daysJumped || certificateChanged) renewed.push(row.domain);
+        });
+        if (renewed.length) renewals.push({ date: snapshot.date, domains: renewed });
+      }
+      previous = byDomain;
+    });
+    return { points: points, renewals: renewals };
+  }
+
+  /** Coordinates for the dependency-free SVG sparkline. */
+  function sparklineGeometry(points, width, height, padding) {
+    var w = typeof width === "number" && width > 0 ? width : 520;
+    var h = typeof height === "number" && height > 0 ? height : 120;
+    var pad = typeof padding === "number" && padding >= 0 ? padding : 8;
+    var list = points || [];
+    if (!list.length) return { width: w, height: h, coords: [], path: "", min: 0, max: 0 };
+    var max = 0;
+    list.forEach(function (point) {
+      if (typeof point.dueSoon === "number" && point.dueSoon > max) max = point.dueSoon;
+    });
+    if (max < 1) max = 1;
+    var span = w - pad * 2;
+    var usable = h - pad * 2;
+    var step = list.length > 1 ? span / (list.length - 1) : 0;
+    var coords = list.map(function (point, index) {
+      var value = typeof point.dueSoon === "number" ? point.dueSoon : 0;
+      var x = list.length > 1 ? pad + step * index : w / 2;
+      var y = h - pad - (value / max) * usable;
+      return {
+        x: Number(x.toFixed(2)),
+        y: Number(y.toFixed(2)),
+        date: point.date,
+        value: value
+      };
+    });
+    var path = coords.map(function (coord, index) {
+      return (index === 0 ? "M" : "L") + coord.x + " " + coord.y;
+    }).join(" ");
+    return { width: w, height: h, coords: coords, path: path, min: 0, max: max };
   }
 
   function expiryValue(row) {
@@ -383,7 +615,11 @@
     var filter = opts.filter || "all";
     var query = String(opts.q || "").trim().toLowerCase();
     var sort = opts.sort || DEFAULT_SORT;
-    var result = rows.filter(function (row) { return matchesFilter(key, row, filter); });
+    var tag = opts.tag || "";
+    var group = opts.group || "";
+    var result = rows.filter(function (row) {
+      return matchesFilter(key, row, filter) && matchesScope(row, tag, group);
+    });
     if (query) {
       result = result.filter(function (row) { return searchText(row).indexOf(query) !== -1; });
     }
@@ -411,17 +647,21 @@
     var filter = opts.filter || "all";
     var sort = opts.sort || DEFAULT_SORT;
     var query = String(opts.q || "");
+    var tag = cleanString(opts.tag, 60);
+    var group = cleanString(opts.group, 60);
     var params = new URLSearchParams();
     if (tab === "domain") params.set("tab", "domain");
     if (filter !== "all" && ALLOWED_FILTERS[tab].indexOf(filter) !== -1) params.set("filter", filter);
     if (query) params.set("q", query.slice(0, 120));
     if (sort !== DEFAULT_SORT && ALLOWED_SORTS.indexOf(sort) !== -1) params.set("sort", sort);
+    if (tag) params.set("tag", tag);
+    else if (group) params.set("group", group);
     var serialized = params.toString();
     return serialized ? "#" + serialized : "#" + tab;
   }
 
   function parseHashState(hash) {
-    var result = { tab: "ssl", filter: "all", q: "", sort: DEFAULT_SORT };
+    var result = { tab: "ssl", filter: "all", q: "", sort: DEFAULT_SORT, tag: "", group: "" };
     var text = String(hash || "").replace(/^#/, "");
     if (text === "ssl" || text === "domain") {
       result.tab = text;
@@ -435,6 +675,10 @@
     if (query) result.q = query.trim().slice(0, 120);
     var sort = params.get("sort");
     if (sort && ALLOWED_SORTS.indexOf(sort) !== -1) result.sort = sort;
+    var tag = params.get("tag");
+    if (tag) result.tag = cleanString(tag, 60);
+    var group = params.get("group");
+    if (group) result.group = cleanString(group, 60);
     return result;
   }
 
@@ -442,6 +686,19 @@
     STALE_MS: STALE_MS,
     FUTURE_SKEW_MS: FUTURE_SKEW_MS,
     DEFAULT_SORT: DEFAULT_SORT,
+    HISTORY_FILE: HISTORY_FILE,
+    HISTORY_WINDOW_DAYS: HISTORY_WINDOW_DAYS,
+    fetchJson: fetchJson,
+    cleanTags: cleanTags,
+    matchesScope: matchesScope,
+    scopeValue: scopeValue,
+    parseScopeValue: parseScopeValue,
+    collectScopes: collectScopes,
+    summarizeBy: summarizeBy,
+    nextSortValue: nextSortValue,
+    normalizeHistory: normalizeHistory,
+    buildHistorySeries: buildHistorySeries,
+    sparklineGeometry: sparklineGeometry,
     parseTimestamp: parseTimestamp,
     staleness: staleness,
     normalizeSslRow: normalizeSslRow,
@@ -492,10 +749,12 @@
     return {
       rows: [], generatedAt: null, skipped: 0,
       status: "loading", error: null, refreshError: null,
-      filter: "all", q: "", sort: DEFAULT_SORT,
+      filter: "all", q: "", sort: DEFAULT_SORT, tag: "", group: "",
       open: new Set()
     };
   }
+
+  var historyState = { status: "loading", snapshots: [], error: null, code: "" };
 
   function byId(id) { return document.getElementById(id); }
 
@@ -506,35 +765,67 @@
     return node;
   }
 
-  function DataError(message) {
+  function DataError(message, code) {
     this.name = "DataError";
     this.message = message;
+    this.code = code || "";
   }
   DataError.prototype = Object.create(Error.prototype);
   DataError.prototype.constructor = DataError;
 
-  function fetchJson(url) {
+  /**
+   * The timeout covers reading the JSON body, not just the response headers:
+   * a proxy can send headers and then stall the body forever. When it fires,
+   * the in-flight entry is released so Retry / Refresh can start a new request.
+   */
+  function fetchJson(url, timeoutMs) {
     if (typeof fetch !== "function") {
-      return Promise.reject(new DataError("This browser cannot fetch the result files."));
+      return Promise.reject(new DataError("This browser cannot fetch the result files.", "unsupported"));
     }
+    var limit = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : FETCH_TIMEOUT_MS;
     var controller = null;
     var timer = null;
+    var timedOut = false;
     var options = { cache: "no-cache", headers: { Accept: "application/json" } };
+    function clearTimer() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    }
+    function timeoutError() {
+      if (timedOut) return new DataError("The request timed out.", "timeout");
+      return null;
+    }
     if (typeof AbortController === "function") {
       controller = new AbortController();
       options.signal = controller.signal;
-      timer = setTimeout(function () { controller.abort(); }, FETCH_TIMEOUT_MS);
+      timer = setTimeout(function () {
+        timedOut = true;
+        controller.abort();
+      }, limit);
     }
     return fetch(url, options).then(function (response) {
-      if (timer) clearTimeout(timer);
-      if (!response.ok) throw new DataError("The server answered HTTP " + response.status + ".");
-      return response.json().catch(function () {
-        throw new DataError("The file is not valid JSON.");
+      if (!response.ok) {
+        clearTimer();
+        throw new DataError("The server answered HTTP " + response.status + ".", "http-" + response.status);
+      }
+      return response.json().then(function (payload) {
+        clearTimer();
+        return payload;
+      }, function (error) {
+        clearTimer();
+        var timeout = timeoutError();
+        if (timeout) throw timeout;
+        if (error && error.name === "AbortError") throw new DataError("The request timed out.", "timeout");
+        throw new DataError("The file is not valid JSON.", "json");
       });
     }, function (error) {
-      if (timer) clearTimeout(timer);
-      if (error && error.name === "AbortError") throw new DataError("The request timed out.");
-      throw new DataError("The request failed (network error).");
+      clearTimer();
+      var timeout = timeoutError();
+      if (timeout) throw timeout;
+      if (error && error.name === "AbortError") throw new DataError("The request timed out.", "timeout");
+      throw new DataError("The request failed (network error).", "network");
     });
   }
 
@@ -594,6 +885,54 @@
       if (inFlight[key] === request) inFlight[key] = null;
     });
     return request;
+  }
+
+  /** Manual refresh, enabled after a stalled or failed request. */
+  function refreshAll() {
+    var button = byId("refresh-btn");
+    if (button) {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+    }
+    var jobs = ["ssl", "domain"].map(function (key) {
+      return state[key].status === "ready" ? revalidateDataset(key) : loadDataset(key);
+    });
+    jobs.push(loadHistory(true));
+    return Promise.all(jobs.map(function (job) {
+      return job && typeof job.then === "function" ? job.catch(function () {}) : Promise.resolve();
+    })).then(function () {
+      if (button) {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+      }
+    });
+  }
+
+  function loadHistory(quiet) {
+    if (!quiet) historyState.status = "loading";
+    if (!quiet) renderHistoryPanels();
+    return fetchJson(HISTORY_FILE).then(function (payload) {
+      var parsed = normalizeHistory(payload);
+      if (!parsed.ok) {
+        historyState.status = "error";
+        historyState.error = parsed.reason;
+        historyState.code = "invalid";
+        historyState.snapshots = [];
+      } else {
+        historyState.status = "ready";
+        historyState.error = null;
+        historyState.code = "";
+        historyState.snapshots = parsed.snapshots;
+      }
+      renderHistoryPanels();
+    }).catch(function (error) {
+      var code = error instanceof DataError ? error.code : "";
+      historyState.status = code === "http-404" ? "missing" : "error";
+      historyState.error = error instanceof DataError ? error.message : "The history file could not be loaded.";
+      historyState.code = code;
+      historyState.snapshots = [];
+      renderHistoryPanels();
+    });
   }
 
   function updateFreshnessViews() {
@@ -682,7 +1021,7 @@
 
   function writeHash() {
     var ds = state[state.tab];
-    var next = buildHashState({ tab: state.tab, filter: ds.filter, q: ds.q, sort: ds.sort });
+    var next = buildHashState({ tab: state.tab, filter: ds.filter, q: ds.q, sort: ds.sort, tag: ds.tag, group: ds.group });
     if (window.location.hash !== next) {
       try {
         window.history.replaceState(null, "", next);
@@ -697,9 +1036,11 @@
     var ds = state[key];
     var search = byId(cfg.prefix + "-search");
     var sort = byId(cfg.prefix + "-sort");
+    var scope = byId(cfg.prefix + "-scope");
     var group = byId(cfg.prefix + "-filters");
     if (search) search.value = ds.q;
     if (sort) sort.value = ds.sort;
+    if (scope) scope.value = scopeValue(ds.tag, ds.group);
     if (group) {
       Array.prototype.forEach.call(group.querySelectorAll("button[data-f]"), function (button) {
         var on = button.getAttribute("data-f") === ds.filter;
@@ -707,6 +1048,62 @@
         button.setAttribute("aria-pressed", on ? "true" : "false");
       });
     }
+    updateSortHeaders(key);
+  }
+
+  /** Rebuild the optional tag/group picker from the rows that were actually read. */
+  function renderScopeOptions(key) {
+    var cfg = DATASETS[key];
+    var ds = state[key];
+    var select = byId(cfg.prefix + "-scope");
+    if (!select) return;
+    var scopes = collectScopes(ds.rows);
+    var current = scopeValue(ds.tag, ds.group);
+    var all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All tags and groups";
+    select.replaceChildren(all);
+    function addGroup(label, items, prefix) {
+      if (!items.length) return;
+      var optgroup = document.createElement("optgroup");
+      optgroup.label = label;
+      items.forEach(function (item) {
+        var option = document.createElement("option");
+        option.value = prefix + item.name;
+        option.textContent = item.name + " (" + item.count + ")";
+        optgroup.append(option);
+      });
+      select.append(optgroup);
+    }
+    addGroup("Tags", scopes.tags, "tag:");
+    addGroup("Groups", scopes.groups, "group:");
+    var known = scopes.tags.some(function (item) { return "tag:" + item.name === current; }) ||
+      scopes.groups.some(function (item) { return "group:" + item.name === current; });
+    if (current && !known) {
+      var missing = document.createElement("option");
+      missing.value = current;
+      missing.textContent = current.replace(/^tag:/, "").replace(/^group:/, "") + " (no matches)";
+      select.append(missing);
+    }
+    select.value = current;
+    var empty = !scopes.tags.length && !scopes.groups.length;
+    select.disabled = empty && !ds.tag && !ds.group;
+    select.title = empty ? "This result file has no tags or groups." : "";
+  }
+
+  function updateSortHeaders(key) {
+    var panel = byId("panel-" + key);
+    if (!panel) return;
+    var ds = state[key];
+    Array.prototype.forEach.call(panel.querySelectorAll("thead th[data-sort-field]"), function (th) {
+      var button = th.querySelector(".sort-btn");
+      if (!button) return;
+      var ascending = button.getAttribute("data-sort-asc") || "";
+      var descending = button.getAttribute("data-sort-desc") || "";
+      var stateName = ds.sort === ascending ? "ascending" : (descending && ds.sort === descending ? "descending" : "none");
+      th.setAttribute("aria-sort", stateName);
+      th.classList.toggle("is-sorted", stateName !== "none");
+    });
   }
 
   function applyHashState(parsed) {
@@ -715,9 +1112,15 @@
     ds.filter = parsed.filter;
     ds.q = parsed.q;
     ds.sort = parsed.sort;
+    ds.tag = parsed.tag;
+    ds.group = parsed.group;
     syncControls(parsed.tab);
     switchTab(parsed.tab, { write: false });
-    if (ds.status === "ready") renderTable(parsed.tab);
+    if (ds.status === "ready") {
+      renderScopeOptions(parsed.tab);
+      renderTable(parsed.tab);
+      updateSortHeaders(parsed.tab);
+    }
   }
 
   function wireTabs() {
@@ -836,11 +1239,19 @@
     var prefix = DATASETS[key].prefix;
     var search = byId(prefix + "-search");
     var sort = byId(prefix + "-sort");
+    var scope = byId(prefix + "-scope");
     var group = byId(prefix + "-filters");
     if (search) search.disabled = !enabled;
     if (sort) sort.disabled = !enabled;
+    if (scope) scope.disabled = !enabled;
     if (group) {
       Array.prototype.forEach.call(group.querySelectorAll("button[data-f]"), function (button) {
+        button.disabled = !enabled;
+      });
+    }
+    var panel = byId("panel-" + key);
+    if (panel) {
+      Array.prototype.forEach.call(panel.querySelectorAll(".sort-btn"), function (button) {
         button.disabled = !enabled;
       });
     }
@@ -862,6 +1273,10 @@
       var node = byId(id);
       if (node) node.hidden = true;
     });
+    var distList = byId(prefix + "-dist-list");
+    var distSummary = byId(prefix + "-dist-summary");
+    if (distList) distList.replaceChildren();
+    if (distSummary) distSummary.textContent = "Loading…";
     renderTimelineEmpty(key, "Loading…");
     setSkeletonRows(key);
     var noRows = byId(prefix + "-norows");
@@ -896,6 +1311,10 @@
     if (note) note.hidden = true;
     var attention = byId(prefix + "-attention");
     if (attention) attention.hidden = true;
+    var distList = byId(prefix + "-dist-list");
+    var distSummary = byId(prefix + "-dist-summary");
+    if (distList) distList.replaceChildren();
+    if (distSummary) distSummary.textContent = "Unavailable";
     renderTimelineEmpty(key, "Unavailable");
     var body = byId(prefix + "-tbody");
     if (body) body.replaceChildren();
@@ -1116,6 +1535,182 @@
     container.setAttribute("aria-label", cfg.noun + " expiry timeline: " + buckets.map(function (bucket) {
       return bucket.label + " " + counts[bucket.id];
     }).join(", "));
+  }
+
+  /* ── provider / registrar distribution ── */
+
+  function renderDistribution(key) {
+    var cfg = DATASETS[key];
+    var ds = state[key];
+    var list = byId(cfg.prefix + "-dist-list");
+    var summary = byId(cfg.prefix + "-dist-summary");
+    if (!list || !summary) return;
+    var field = key === "ssl" ? "provider" : "registrar";
+    var noun = key === "ssl" ? "certificate" : "domain";
+    var result = summarizeBy(ds.rows, field, 6);
+    list.replaceChildren();
+    var onlyMissing = result.buckets.length === 1 && result.buckets[0].name === "Not recorded";
+    if (!ds.rows.length || onlyMissing) {
+      summary.textContent = "No " + (key === "ssl" ? "provider" : "registrar") +
+        " data is available in this result file.";
+      return;
+    }
+    var labelCount = result.buckets.length - (result.buckets.some(function (bucket) { return bucket.other; }) ? 1 : 0);
+    var folded = result.buckets.some(function (bucket) { return bucket.other; });
+    var kind = key === "ssl" ? "issuer" : "registrar";
+    summary.textContent = (folded
+      ? "Top " + labelCount + " of " + result.distinct + " " + kind + "s"
+      : result.distinct + " " + kind + (result.distinct === 1 ? "" : "s")) +
+      " across " + result.total + " " + noun + (result.total === 1 ? "" : "s") + ".";
+    result.buckets.forEach(function (bucket) {
+      var item = el("li", "dist-item");
+      item.append(el("span", "dist-name", bucket.name));
+      var track = el("span", "dist-track");
+      track.setAttribute("aria-hidden", "true");
+      var fill = el("span", "dist-fill");
+      fill.style.width = (bucket.share * 100).toFixed(2) + "%";
+      track.append(fill);
+      item.append(track, el("span", "dist-count", String(bucket.count)));
+      item.setAttribute("aria-label", bucket.name + ": " + bucket.count + " of " + result.total +
+        " " + noun + (result.total === 1 ? "" : "s") + " (" + Math.round(bucket.share * 100) + "%)");
+      list.append(item);
+    });
+  }
+
+  /* ── optional history sparkline ── */
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgNode(name, attributes) {
+    var node = document.createElementNS(SVG_NS, name);
+    Object.keys(attributes || {}).forEach(function (name) {
+      node.setAttribute(name, String(attributes[name]));
+    });
+    return node;
+  }
+
+  function historyFailureText() {
+    if (historyState.status === "loading") return "Loading history…";
+    if (historyState.status === "missing") {
+      return "History is not published yet. The current results above are unaffected.";
+    }
+    return "History could not be read" + (historyState.error ? " (" + historyState.error + ")" : "") +
+      ". The current results above are unaffected.";
+  }
+
+  function renderHistory(key) {
+    var cfg = DATASETS[key];
+    var chart = byId(cfg.prefix + "-history-chart");
+    var summary = byId(cfg.prefix + "-history-summary");
+    var empty = byId(cfg.prefix + "-history-empty");
+    var data = byId(cfg.prefix + "-history-data");
+    var body = byId(cfg.prefix + "-history-tbody");
+    if (!chart || !summary || !empty) return;
+    chart.replaceChildren();
+    if (body) body.replaceChildren();
+    if (data) data.hidden = true;
+    if (historyState.status !== "ready") {
+      var failure = historyFailureText();
+      empty.hidden = false;
+      empty.textContent = failure;
+      summary.textContent = historyState.status === "loading" ? "Loading…" : "Not available";
+      return;
+    }
+    var series = buildHistorySeries(key, historyState.snapshots);
+    if (!series.points.length) {
+      var message = historyState.snapshots.length
+        ? "No " + (key === "ssl" ? "certificate" : "domain") + " snapshots have been recorded yet."
+        : "No history snapshots have been recorded yet.";
+      empty.hidden = false;
+      empty.textContent = message;
+      summary.textContent = message;
+      return;
+    }
+    empty.hidden = true;
+    empty.textContent = "";
+    var geometry = sparklineGeometry(series.points, 520, 120, 14);
+    var pad = 14;
+    var baseline = geometry.height - pad;
+    var peak = 0;
+    series.points.forEach(function (point) {
+      if (point.dueSoon > peak) peak = point.dueSoon;
+    });
+    var first = series.points[0].date;
+    var last = series.points[series.points.length - 1].date;
+    var label = (key === "ssl" ? "Certificate" : "Domain") + " history: " + series.points.length +
+      " checks from " + first + " to " + last + "; peak " + peak +
+      " due within 30 days; " + series.renewals.length +
+      " renewal " + (series.renewals.length === 1 ? "date" : "dates") + ".";
+    var svg = svgNode("svg", {
+      viewBox: "0 0 " + geometry.width + " " + geometry.height,
+      "class": "spark",
+      role: "img",
+      "aria-label": label
+    });
+    var title = svgNode("title", {});
+    title.textContent = label;
+    svg.append(title);
+    svg.append(svgNode("line", {
+      x1: pad, y1: baseline, x2: geometry.width - pad, y2: baseline, "class": "spark-grid"
+    }));
+    svg.append(svgNode("line", {
+      x1: pad, y1: pad, x2: geometry.width - pad, y2: pad, "class": "spark-grid"
+    }));
+    if (geometry.coords.length) {
+      var area = "M" + geometry.coords[0].x + " " + baseline;
+      geometry.coords.forEach(function (coord) { area += " L" + coord.x + " " + coord.y; });
+      area += " L" + geometry.coords[geometry.coords.length - 1].x + " " + baseline + " Z";
+      svg.append(svgNode("path", { d: area, "class": "spark-area" }));
+      svg.append(svgNode("path", { d: geometry.path, "class": "spark-line" }));
+    }
+    series.renewals.forEach(function (renewal) {
+      var coord = null;
+      geometry.coords.forEach(function (candidate) {
+        if (candidate.date === renewal.date) coord = candidate;
+      });
+      if (!coord) return;
+      var marker = svgNode("line", {
+        x1: coord.x, y1: pad, x2: coord.x, y2: baseline, "class": "spark-renewal-line"
+      });
+      var markerTitle = svgNode("title", {});
+      markerTitle.textContent = "Renewal on " + renewal.date + ": " + renewal.domains.slice(0, 6).join(", ") +
+        (renewal.domains.length > 6 ? " and " + (renewal.domains.length - 6) + " more" : "");
+      marker.append(markerTitle);
+      svg.append(marker);
+      svg.append(svgNode("circle", {
+        cx: coord.x, cy: coord.y, r: 3.5, "class": "spark-renewal"
+      }));
+    });
+    if (geometry.coords.length) {
+      var lastCoord = geometry.coords[geometry.coords.length - 1];
+      svg.append(svgNode("circle", {
+        cx: lastCoord.x, cy: lastCoord.y, r: 2.5, "class": "spark-last"
+      }));
+    }
+    chart.append(svg);
+    summary.textContent = series.points.length + (series.points.length === 1 ? " check" : " checks") +
+      " · " + first + " to " + last + " · peak " + peak + " due within 30 days · " +
+      series.renewals.length + " renewal " + (series.renewals.length === 1 ? "date" : "dates") + ".";
+    if (data && body) {
+      data.hidden = false;
+      series.points.forEach(function (point, index) {
+        var renewal = null;
+        series.renewals.forEach(function (candidate) {
+          if (candidate.date === point.date) renewal = candidate;
+        });
+        var tr = el("tr");
+        [point.date, point.total, point.dueSoon, point.expired,
+          renewal ? renewal.domains.length : 0].forEach(function (value) {
+          tr.append(el("td", null, String(value)));
+        });
+        body.append(tr);
+        if (index === series.points.length - 1) tr.classList.add("is-last");
+      });
+    }
+  }
+
+  function renderHistoryPanels() {
+    ["ssl", "domain"].forEach(function (key) { renderHistory(key); });
   }
 
   function providerMeta(kind, name) {
@@ -1433,7 +2028,7 @@
     var noRows = byId(cfg.prefix + "-norows");
     var status = byId(cfg.prefix + "-status");
     if (!body) return;
-    var rows = filterAndSort(key, ds.rows, { filter: ds.filter, q: ds.q, sort: ds.sort });
+    var rows = filterAndSort(key, ds.rows, { filter: ds.filter, q: ds.q, sort: ds.sort, tag: ds.tag, group: ds.group });
     body.replaceChildren();
     rows.forEach(function (row, index) {
       var built = buildRow(key, row, index);
@@ -1449,6 +2044,8 @@
       var pieces = ["Showing " + rows.length + " of " + ds.rows.length + " " + cfg.noun];
       var label = filterLabel(key, ds.filter);
       if (label) pieces.push(label);
+      if (ds.tag) pieces.push("tag “" + ds.tag.slice(0, 60) + "”");
+      if (ds.group) pieces.push("group “" + ds.group.slice(0, 60) + "”");
       var query = ds.q.trim();
       if (query) pieces.push("search “" + query.slice(0, 80) + "”");
       status.textContent = pieces.join(" · ");
@@ -1463,7 +2060,9 @@
     var ds = state[key];
     var box = byId(cfg.prefix + "-note");
     var text = byId(cfg.prefix + "-note-text");
+    var action = byId(cfg.prefix + "-note-action");
     if (!box || !text) return;
+    if (action) action.hidden = true;
     if (ds.status !== "ready") {
       box.hidden = true;
       return;
@@ -1483,6 +2082,7 @@
     }
     box.hidden = false;
     text.textContent = messages.join(" ");
+    if (action) action.hidden = !ds.refreshError;
   }
 
   function renderPanel(key) {
@@ -1493,7 +2093,10 @@
     renderStale(key);
     renderAttention(key);
     renderTimeline(key);
+    renderDistribution(key);
+    renderScopeOptions(key);
     renderTable(key);
+    updateSortHeaders(key);
     renderNote(key);
     updateExportState();
     updateHeader();
@@ -1585,7 +2188,7 @@
   function exportCsv(key) {
     var ds = state[key];
     if (ds.status !== "ready") return;
-    var rows = filterAndSort(key, ds.rows, { filter: ds.filter, q: ds.q, sort: ds.sort });
+    var rows = filterAndSort(key, ds.rows, { filter: ds.filter, q: ds.q, sort: ds.sort, tag: ds.tag, group: ds.group });
     var headers;
     var matrix;
     if (key === "ssl") {
@@ -1608,7 +2211,7 @@
   function exportJson(key) {
     var ds = state[key];
     if (ds.status !== "ready") return;
-    var rows = filterAndSort(key, ds.rows, { filter: ds.filter, q: ds.q, sort: ds.sort });
+    var rows = filterAndSort(key, ds.rows, { filter: ds.filter, q: ds.q, sort: ds.sort, tag: ds.tag, group: ds.group });
     var payload = {
       generated_at: ds.generatedAt,
       exported_at: new Date().toISOString(),
@@ -1699,8 +2302,43 @@
     if (sort) {
       sort.addEventListener("change", function () {
         state[key].sort = ALLOWED_SORTS.indexOf(sort.value) === -1 ? DEFAULT_SORT : sort.value;
+        updateSortHeaders(key);
         renderTable(key);
         writeHash();
+      });
+    }
+
+    var scope = byId(prefix + "-scope");
+    if (scope) {
+      scope.addEventListener("change", function () {
+        var parsed = parseScopeValue(scope.value);
+        state[key].tag = parsed.tag;
+        state[key].group = parsed.group;
+        renderTable(key);
+        writeHash();
+      });
+    }
+
+    var panel = byId("panel-" + key);
+    var head = panel ? panel.querySelector(".table-card thead") : null;
+    if (head) {
+      head.addEventListener("click", function (event) {
+        var button = event.target.closest(".sort-btn");
+        if (!button || button.disabled) return;
+        var ascending = button.getAttribute("data-sort-asc") || "";
+        var descending = button.getAttribute("data-sort-desc") || "";
+        if (ALLOWED_SORTS.indexOf(ascending) === -1) return;
+        state[key].sort = nextSortValue(state[key].sort, ascending, descending);
+        syncControls(key);
+        renderTable(key);
+        writeHash();
+      });
+    }
+
+    var noteAction = byId(prefix + "-note-action");
+    if (noteAction) {
+      noteAction.addEventListener("click", function () {
+        revalidateDataset(key);
       });
     }
 
@@ -1726,13 +2364,18 @@
         tab: state.tab,
         filter: state[state.tab].filter,
         q: state[state.tab].q,
-        sort: state[state.tab].sort
+        sort: state[state.tab].sort,
+        tag: state[state.tab].tag,
+        group: state[state.tab].group
       }));
     }
 
     renderLoading("ssl");
     renderLoading("domain");
     updateGlobalAlert();
+
+    var refresh = byId("refresh-btn");
+    if (refresh) refresh.addEventListener("click", refreshAll);
 
     var globalRetry = byId("global-retry");
     if (globalRetry) {
@@ -1754,6 +2397,7 @@
 
     loadDataset("ssl");
     loadDataset("domain");
+    loadHistory();
   }
 
   if (document.readyState === "loading") {

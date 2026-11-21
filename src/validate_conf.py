@@ -227,6 +227,7 @@ def process_file(path: Path, check_dns: bool, strip_www_prefix: bool = True) -> 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_FILES = [str(ROOT_DIR / "ssl.conf"), str(ROOT_DIR / "domains.conf")]
+DEFAULT_TOML = ROOT_DIR / "certiwatch.toml"
 
 
 def strip_www_for(path: Path) -> bool:
@@ -234,15 +235,42 @@ def strip_www_for(path: Path) -> bool:
     return path.name != "ssl.conf"
 
 
+def _validate_toml(path: Path) -> bool:
+    from config import ConfigError, load_config
+
+    try:
+        loaded = load_config(path)
+    except (ConfigError, OSError) as exc:
+        print(f"\n  {c(RED, 'ERROR:')} {exc}")
+        return False
+
+    print(
+        f"\n  {c(GREEN, '✓')} {path.name} is valid "
+        f"({len(loaded.targets)} targets, thresholds "
+        f"{list(loaded.thresholds)}, history_limit={loaded.history_limit})"
+    )
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate and auto-fix domains.conf / ssl.conf."
+        description="Validate certiwatch.toml, and optionally clean legacy .conf files."
     )
     parser.add_argument(
         "files",
         nargs="*",
-        default=DEFAULT_FILES,
-        help="Config files to process (default: ssl.conf domains.conf)",
+        default=[],
+        help="Legacy config files to process (default: ssl.conf domains.conf)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=f"TOML file to validate (default: {DEFAULT_TOML.name} when present)",
+    )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Also validate and auto-fix the legacy ssl.conf/domains.conf files",
     )
     parser.add_argument(
         "--no-dns",
@@ -251,13 +279,26 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    paths = [Path(f) for f in args.files]
     check_dns = not args.no_dns
+    toml_path = Path(args.config) if args.config else (
+        DEFAULT_TOML if DEFAULT_TOML.exists() else None
+    )
 
-    print(c(BOLD, "\n=== webLankan conf validator + auto-fixer ==="))
+    print(c(BOLD, "\n=== CertiWatch config validator + auto-fixer ==="))
     print(f"  {c(DIM, 'DNS checks ' + ('disabled' if not check_dns else 'enabled (--no-dns to skip)'))}")
 
-    ok = all(process_file(p, check_dns, strip_www_for(p)) for p in paths)
+    if toml_path is not None:
+        if not _validate_toml(toml_path):
+            print(f"\n{'─' * 55}")
+            print(c(RED + BOLD, "  Configuration is invalid.\n"))
+            return 1
+        if not args.files and not args.legacy:
+            print(f"\n{'─' * 55}")
+            print(c(GREEN + BOLD, "  Done. TOML configuration is clean.\n"))
+            return 0
+
+    paths = [Path(f) for f in (args.files or DEFAULT_FILES)]
+    ok = all([process_file(p, check_dns, strip_www_for(p)) for p in paths])
 
     print(f"\n{'─' * 55}")
     if ok:

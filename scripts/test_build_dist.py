@@ -22,10 +22,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-BUILDER = Path(__file__).resolve().parent / "build_dist.py"
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import build_public_feeds as feeds  # noqa: E402
+
+BUILDER = SCRIPT_DIR / "build_dist.py"
 
 REQUIRED = ["_headers", "domain_results.json", "index.html", "ssl_results.json"]
 OPTIONAL = ["app.js", "style.css"]
+FEEDS = ["badges/manifest.json", "expiries.ics", "status.json"]
 
 GENERATED_AT = "2026-11-21T00:00:00+00:00"
 
@@ -45,9 +52,52 @@ def result_doc(statuses: list[str]) -> str:
 
 
 RESULT_JSON = result_doc(["valid"])
+HISTORY_JSON = json.dumps(
+    {
+        "snapshots": [
+            {
+                "date": "2026-11-20",
+                "ssl": [
+                    {
+                        "domain": "host0.example",
+                        "days_left": 30,
+                        "status": "valid",
+                        "fingerprint_sha256": None,
+                    }
+                ],
+                "domains": [],
+            }
+        ]
+    },
+    indent=2,
+) + "\n"
 
 
-def write_fixture(root: Path, optional: bool = False, **overrides: str | None) -> None:
+def expected_bundle(
+    statuses: tuple[str, ...] = ("valid",),
+    *,
+    optional: bool = False,
+    history: bool = False,
+) -> list[str]:
+    domains = [f"host{index}.example" for index in range(len(statuses))]
+    names = [
+        *REQUIRED,
+        *FEEDS,
+        *(f"badges/{feeds.badge_filename(domain)}" for domain in domains),
+    ]
+    if optional:
+        names.extend(OPTIONAL)
+    if history:
+        names.append("history.json")
+    return sorted(names)
+
+
+def write_fixture(
+    root: Path,
+    optional: bool = False,
+    history: bool = False,
+    **overrides: str | None,
+) -> None:
     files: dict[str, str] = {
         "index.html": "<!doctype html><title>fixture</title>\n",
         "ssl_results.json": RESULT_JSON,
@@ -57,6 +107,8 @@ def write_fixture(root: Path, optional: bool = False, **overrides: str | None) -
     if optional:
         files["app.js"] = "console.log('fixture');\n"
         files["style.css"] = "body{color:#000}\n"
+    if history:
+        files["history.json"] = HISTORY_JSON
     files.update(overrides)
 
     for rel, text in files.items():
@@ -98,8 +150,8 @@ def case_required_only(tmp: Path) -> None:
     write_fixture(source)
     result = run(source, out)
     expect(result.returncode == 0, f"expected success, got {result.returncode}: {result.stderr}")
-    expect(bundle_files(out) == REQUIRED, f"unexpected bundle: {bundle_files(out)}")
-    expect("Files: 4" in result.stdout, f"manifest not reported:\n{result.stdout}")
+    expect(bundle_files(out) == expected_bundle(), f"unexpected bundle: {bundle_files(out)}")
+    expect("Files: 8" in result.stdout, f"manifest not reported:\n{result.stdout}")
     headers = (out / "_headers").read_text(encoding="utf-8")
     expect("must-revalidate" in headers, "_headers content lost")
 
@@ -109,7 +161,10 @@ def case_optional_assets(tmp: Path) -> None:
     write_fixture(source, optional=True)
     result = run(source, out)
     expect(result.returncode == 0, f"expected success, got {result.returncode}: {result.stderr}")
-    expect(bundle_files(out) == sorted(REQUIRED + OPTIONAL), f"unexpected bundle: {bundle_files(out)}")
+    expect(
+        bundle_files(out) == expected_bundle(optional=True),
+        f"unexpected bundle: {bundle_files(out)}",
+    )
 
 
 def case_ignores_unlisted(tmp: Path) -> None:
@@ -117,7 +172,7 @@ def case_ignores_unlisted(tmp: Path) -> None:
     write_fixture(source, **{"src/secret.py": "print('internal')\n", "README.md": "# notes\n"})
     result = run(source, out)
     expect(result.returncode == 0, f"expected success, got {result.returncode}: {result.stderr}")
-    expect(bundle_files(out) == REQUIRED, f"unlisted file shipped: {bundle_files(out)}")
+    expect(bundle_files(out) == expected_bundle(), f"unlisted file shipped: {bundle_files(out)}")
 
 
 # ── Missing or malformed input ───────────────────────────────────────────────
@@ -176,7 +231,10 @@ def case_mixed_unreachable_publishes(tmp: Path) -> None:
     write_fixture(source, **{"ssl_results.json": result_doc(["dns_error", "expired", "invalid"])})
     result = run(source, out)
     expect(result.returncode == 0, f"expected success, got {result.returncode}: {result.stderr}")
-    expect(bundle_files(out) == REQUIRED, f"unexpected bundle: {bundle_files(out)}")
+    expect(
+        bundle_files(out) == expected_bundle(("dns_error", "expired", "invalid")),
+        f"unexpected bundle: {bundle_files(out)}",
+    )
 
 
 def case_certificate_failures_publish(tmp: Path) -> None:
@@ -184,7 +242,10 @@ def case_certificate_failures_publish(tmp: Path) -> None:
     write_fixture(source, **{"ssl_results.json": result_doc(["expired", "invalid", "valid"])})
     result = run(source, out)
     expect(result.returncode == 0, f"real certificate failures must publish: {result.stderr}")
-    expect(bundle_files(out) == REQUIRED, f"unexpected bundle: {bundle_files(out)}")
+    expect(
+        bundle_files(out) == expected_bundle(("expired", "invalid", "valid")),
+        f"unexpected bundle: {bundle_files(out)}",
+    )
 
 
 def case_empty_rows_gate(tmp: Path) -> None:
@@ -222,7 +283,7 @@ def case_in_tree_dist_allowed(tmp: Path) -> None:
     out = source / "dist"
     result = run(source, out)
     expect(result.returncode == 0, f"dist inside source must be allowed: {result.stderr}")
-    expect(bundle_files(out) == REQUIRED, f"unexpected bundle: {bundle_files(out)}")
+    expect(bundle_files(out) == expected_bundle(), f"unexpected bundle: {bundle_files(out)}")
 
 
 def case_unmanaged_nonempty_destination(tmp: Path) -> None:
@@ -257,13 +318,16 @@ def case_managed_bundle_replaced(tmp: Path) -> None:
     source, out = tmp / "src", tmp / "dist"
     write_fixture(source, optional=True)
     expect(run(source, out).returncode == 0, "first build failed")
-    expect(bundle_files(out) == sorted(REQUIRED + OPTIONAL), f"unexpected first bundle: {bundle_files(out)}")
+    expect(
+        bundle_files(out) == expected_bundle(optional=True),
+        f"unexpected first bundle: {bundle_files(out)}",
+    )
 
     (source / "app.js").unlink()
     (source / "style.css").unlink()
     result = run(source, out)
     expect(result.returncode == 0, f"managed bundle must be replaceable: {result.stderr}")
-    expect(bundle_files(out) == REQUIRED, f"stale assets survived: {bundle_files(out)}")
+    expect(bundle_files(out) == expected_bundle(), f"stale assets survived: {bundle_files(out)}")
 
 
 def case_destination_symlink_refused(tmp: Path) -> None:
@@ -299,6 +363,135 @@ def case_symlinked_parent_refused(tmp: Path) -> None:
     expect(not out.exists(), "symlinked parent produced a bundle")
 
 
+# ── History and generated feeds ─────────────────────────────────────────────
+
+
+def case_repository_headers_cover_public_types(_tmp: Path) -> None:
+    headers = (SCRIPT_DIR.parent / "pages" / "_headers").read_text(encoding="utf-8")
+    for needle in (
+        "/ssl_results.json",
+        "/domain_results.json",
+        "/status.json",
+        "/history.json",
+        "/expiries.ics",
+        "/badges/*",
+        "text/calendar",
+        "image/svg+xml",
+    ):
+        expect(needle in headers, f"pages/_headers is missing {needle!r}")
+
+
+def case_public_history_is_published(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    write_fixture(source, history=True)
+    result = run(source, out)
+    expect(result.returncode == 0, f"expected success, got {result.returncode}: {result.stderr}")
+    expect(
+        bundle_files(out) == expected_bundle(history=True),
+        f"unexpected bundle: {bundle_files(out)}",
+    )
+    published = json.loads((out / "history.json").read_text(encoding="utf-8"))
+    expect(published["snapshots"][0]["date"] == "2026-11-20", "history content changed")
+
+
+def case_invalid_history_is_refused(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    payload = json.dumps({"snapshots": []})
+    write_fixture(source, **{"history.json": payload})
+    result = run(source, out)
+    expect_build_error(result, 1, "snapshots")
+    expect(not out.exists(), "invalid history produced a bundle")
+
+
+def case_private_history_metadata_is_refused(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    payload = json.dumps(
+        {
+            "snapshots": [
+                {
+                    "date": "2026-11-20",
+                    "ssl": [
+                        {
+                            "domain": "host0.example",
+                            "days_left": 30,
+                            "status": "valid",
+                            "fingerprint_sha256": None,
+                            "owner": "ops@example.com",
+                        }
+                    ],
+                    "domains": [],
+                }
+            ]
+        }
+    )
+    write_fixture(source, **{"history.json": payload})
+    expect_build_error(run(source, out), 1, "unexpected keys")
+
+
+def case_duplicate_history_dates_are_refused(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    payload = json.dumps(
+        {
+            "snapshots": [
+                {"date": "2026-11-20", "ssl": [], "domains": []},
+                {"date": "2026-11-20", "ssl": [], "domains": []},
+            ]
+        }
+    )
+    write_fixture(source, **{"history.json": payload})
+    expect_build_error(run(source, out), 1, "duplicate snapshot date")
+
+
+def case_repeat_build_accepts_its_own_feeds(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    write_fixture(source, history=True)
+    expect(run(source, out).returncode == 0, "first build failed")
+    second = run(source, out)
+    expect(second.returncode == 0, f"second build failed: {second.stderr}")
+    expect(
+        bundle_files(out) == expected_bundle(history=True),
+        f"repeat build changed the bundle: {bundle_files(out)}",
+    )
+
+
+def case_foreign_badge_file_is_refused(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    write_fixture(source)
+    expect(run(source, out).returncode == 0, "first build failed")
+    foreign = out / "badges" / "evil.svg"
+    foreign.write_text("<svg/>\n", encoding="utf-8")
+    result = run(source, out)
+    expect_build_error(result, 2, "not a previous CertiWatch bundle")
+    expect(foreign.exists(), "foreign badge was deleted")
+
+
+def case_feed_failure_keeps_previous_bundle(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    write_fixture(source)
+    expect(run(source, out).returncode == 0, "first build failed")
+    before = (out / "status.json").read_bytes()
+
+    bad = json.dumps(
+        {
+            "generated_at": GENERATED_AT,
+            "results": [{"domain": "bad_host.example", "status": "valid"}],
+        }
+    )
+    (source / "ssl_results.json").write_text(bad, encoding="utf-8")
+    result = run(source, out)
+    expect_build_error(result, 1, "public feeds")
+    expect((out / "status.json").read_bytes() == before, "failed feed replaced the old bundle")
+
+
+def case_symlinked_history_refused(tmp: Path) -> None:
+    source, out = tmp / "src", tmp / "dist"
+    write_fixture(source)
+    real = tmp / "real-history.json"
+    real.write_text(HISTORY_JSON, encoding="utf-8")
+    (source / "history.json").symlink_to(real)
+    expect_build_error(run(source, out), 2, "is a symlink")
+
+
 CASES = [
     ("required-only bundle is exactly the allowlist", case_required_only),
     ("optional app.js/style.css join the allowlist when present", case_optional_assets),
@@ -321,6 +514,15 @@ CASES = [
     ("symlinked destination is refused", case_destination_symlink_refused),
     ("symlinked input file is refused", case_symlinked_input_refused),
     ("symlinked parent directory is refused", case_symlinked_parent_refused),
+    ("repository headers cover every public type", case_repository_headers_cover_public_types),
+    ("public history is published", case_public_history_is_published),
+    ("invalid history is refused", case_invalid_history_is_refused),
+    ("private history metadata is refused", case_private_history_metadata_is_refused),
+    ("duplicate history dates are refused", case_duplicate_history_dates_are_refused),
+    ("repeat build accepts its own generated feeds", case_repeat_build_accepts_its_own_feeds),
+    ("foreign badge file is refused intact", case_foreign_badge_file_is_refused),
+    ("feed failure keeps the previous bundle", case_feed_failure_keeps_previous_bundle),
+    ("symlinked history is refused", case_symlinked_history_refused),
 ]
 
 

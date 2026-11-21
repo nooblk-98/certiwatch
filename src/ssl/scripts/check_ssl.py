@@ -30,22 +30,35 @@ Outputs results to ssl_results.json (written atomically).
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
 import datetime
+import http.client
 import ipaddress
 import json
 import os
 import re
 import socket
 import ssl
+import sys
 import tempfile
 import urllib.parse
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
 from cryptography.x509.oid import NameOID
+
+try:
+    from config import CONFIG_FILE, ConfigError, Target, load_config
+    from dns_diagnostics import diagnose_dns
+except ModuleNotFoundError:  # direct ``python3 src/ssl/scripts/check_ssl.py``
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from config import CONFIG_FILE, ConfigError, Target, load_config
+    from dns_diagnostics import diagnose_dns
 
 DOMAIN_FILE = "ssl.conf"
 OUTPUT_FILE = "ssl_results.json"
@@ -277,6 +290,36 @@ def hostname_matches(host: str, dns_names: list[str], ip_addresses: list[str]) -
     return any(_dnsname_match(pattern, host) for pattern in dns_names)
 
 
+def classify_key_strength(key_type: str | None, key_size: int | None) -> str:
+    """Classify a leaf key without pretending a borderline key is safe.
+
+    ``weak`` means below current common practice; ``acceptable`` meets the
+    common 2048-bit RSA / 256-bit ECDSA floor; ``strong`` is above it. Unknown
+    key types are not guessed.
+    """
+    if key_type == "RSA":
+        if not isinstance(key_size, int):
+            return "unknown"
+        if key_size < 2048:
+            return "weak"
+        if key_size < 3072:
+            return "acceptable"
+        return "strong"
+    if key_type == "ECDSA":
+        if not isinstance(key_size, int):
+            return "unknown"
+        if key_size < 256:
+            return "weak"
+        if key_size < 384:
+            return "acceptable"
+        return "strong"
+    if key_type in ("Ed25519", "Ed448"):
+        return "strong"
+    if key_type == "DSA":
+        return "weak"
+    return "unknown"
+
+
 def _key_metadata(cert: x509.Certificate) -> tuple[str | None, int | None, str | None]:
     public_key = cert.public_key()
     if isinstance(public_key, rsa.RSAPublicKey):
@@ -332,6 +375,7 @@ def certificate_metadata(
         "key_type": key_type,
         "key_size": key_size,
         "key_curve": key_curve,
+        "key_strength": classify_key_strength(key_type, key_size),
         "fingerprint_sha256": _fingerprint(cert),
         "serial_number": format(cert.serial_number, "X"),
     }
@@ -367,6 +411,346 @@ def _chain_summary(chain_der: list[bytes]) -> tuple[list[dict], bool]:
     return rows, complete
 
 
+# ── HSTS (HTTPS only) ────────────────────────────────────────────────────────
+
+
+def classify_hsts(headers: Mapping[str, str]) -> dict:
+    """Classify a Strict-Transport-Security header without over-claiming."""
+    value = None
+    for key, header in headers.items():
+        if str(key).lower() == "strict-transport-security":
+            value = header
+            break
+    if value is None:
+        return {
+            "present": False,
+            "valid": False,
+            "max_age": None,
+            "include_subdomains": False,
+            "preload": False,
+            "error": None,
+        }
+
+    directives = [part.strip() for part in str(value).split(";") if part.strip()]
+    max_age: int | None = None
+    include_subdomains = False
+    preload = False
+    error = None
+    for directive in directives:
+        name, _, raw_value = directive.partition("=")
+        name = name.strip().lower()
+        raw_value = raw_value.strip().strip('"')
+        if name == "max-age":
+            try:
+                max_age = int(raw_value)
+            except ValueError:
+                error = "max-age is not an integer"
+            else:
+                if max_age < 0:
+                    error = "max-age cannot be negative"
+        elif name == "includesubdomains":
+            include_subdomains = True
+        elif name == "preload":
+            preload = True
+
+    if max_age is None and error is None:
+        error = "max-age directive is missing"
+    return {
+        "present": True,
+        "valid": max_age is not None and max_age >= 0,
+        "max_age": max_age,
+        "include_subdomains": include_subdomains,
+        "preload": preload,
+        "error": error,
+    }
+
+
+def fetch_https_headers(host: str, port: int, *, timeout: float = TIMEOUT) -> dict[str, str]:
+    """Read response headers with a HEAD request. No certificate trust is implied."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(
+        host,
+        port,
+        timeout=timeout,
+        context=context,
+    )
+    host_header = format_endpoint(host, port)
+    try:
+        connection.request(
+            "HEAD",
+            "/",
+            headers={
+                "Host": host_header,
+                "User-Agent": "CertiWatch/1.0",
+                "Connection": "close",
+            },
+        )
+        response = connection.getresponse()
+        headers = {str(key).lower(): value for key, value in response.getheaders()}
+        response.read()
+        return headers
+    finally:
+        connection.close()
+
+
+def _hsts_not_applicable() -> dict:
+    return {
+        "applicable": False,
+        "checked": False,
+        "present": None,
+        "valid": None,
+        "max_age": None,
+        "include_subdomains": None,
+        "preload": None,
+        "error": None,
+    }
+
+
+def check_hsts(
+    host: str,
+    port: int,
+    *,
+    applicable: bool,
+    fetcher: Callable[[str, int], Mapping[str, str]] | None = None,
+    timeout: float = TIMEOUT,
+) -> dict:
+    """Read HSTS only for an HTTPS origin; a non-HTTPS endpoint is inapplicable."""
+    if not applicable:
+        return _hsts_not_applicable()
+
+    if fetcher is None:
+        fetcher = lambda target_host, target_port: fetch_https_headers(
+            target_host, target_port, timeout=timeout
+        )
+    try:
+        headers = fetcher(host, port)
+    except Exception as exc:
+        classification = classify_hsts({})
+        classification.update(
+            {
+                "applicable": True,
+                "checked": True,
+                "present": False,
+                "valid": False,
+                "error": _trim(str(exc), 180) or "HTTPS header request failed",
+            }
+        )
+        return classification
+
+    classification = classify_hsts(headers)
+    classification.update({"applicable": True, "checked": True})
+    return classification
+
+
+# ── STARTTLS and optional TLS 1.0/1.1 capability ────────────────────────────
+
+
+class StartTLSError(ssl.SSLError):
+    """A STARTTLS-capable service refused or did not advertise STARTTLS."""
+
+
+class StartTLSUnsupported(StartTLSError):
+    """The requested STARTTLS protocol is not implemented locally."""
+
+
+class LocalTLSUnsupported(ssl.SSLError):
+    """Local OpenSSL/Python cannot negotiate this protocol version."""
+
+
+def _read_line(sock: socket.socket, limit: int = 4096) -> str:
+    data = bytearray()
+    while len(data) < limit:
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if data.endswith(b"\n"):
+            break
+    return data.decode("utf-8", errors="replace").rstrip("\r\n")
+
+
+def _require_line(prefixes: tuple[str, ...], line: str, protocol: str) -> None:
+    if not any(line.upper().startswith(prefix.upper()) for prefix in prefixes):
+        raise StartTLSError(
+            f"{protocol.upper()} did not accept STARTTLS: {line[:120] or 'no response'}"
+        )
+
+
+def _starttls_smtp(sock: socket.socket) -> None:
+    greeting = _read_line(sock)
+    _require_line(("220",), greeting, "smtp")
+    sock.sendall(b"EHLO certiwatch.local\r\n")
+    capabilities: list[str] = []
+    while True:
+        line = _read_line(sock)
+        if not line:
+            raise StartTLSError("SMTP closed the connection during EHLO")
+        capabilities.append(line)
+        if len(line) >= 4 and line[3] == " ":
+            break
+    if not any("STARTTLS" in line.upper() for line in capabilities):
+        raise StartTLSError("SMTP server does not advertise STARTTLS")
+    sock.sendall(b"STARTTLS\r\n")
+    _require_line(("220",), _read_line(sock), "smtp")
+
+
+def _starttls_imap(sock: socket.socket) -> None:
+    greeting = _read_line(sock)
+    upper = greeting.upper()
+    if not (upper.startswith("* OK") or upper.startswith("* PREAUTH")):
+        raise StartTLSError(f"IMAP greeting rejected STARTTLS: {greeting[:120]}")
+    sock.sendall(b"a001 STARTTLS\r\n")
+    while True:
+        line = _read_line(sock)
+        if not line:
+            raise StartTLSError("IMAP closed the connection during STARTTLS")
+        if line.upper().startswith("A001 "):
+            _require_line(("a001 OK",), line, "imap")
+            return
+
+
+def _starttls_pop3(sock: socket.socket) -> None:
+    _require_line(("+OK",), _read_line(sock), "pop3")
+    sock.sendall(b"STLS\r\n")
+    _require_line(("+OK",), _read_line(sock), "pop3")
+
+
+def _starttls_exchange(sock: socket.socket, protocol: str | None) -> None:
+    normalised = (protocol or "smtp").strip().lower()
+    handlers = {
+        "smtp": _starttls_smtp,
+        "imap": _starttls_imap,
+        "pop3": _starttls_pop3,
+    }
+    handler = handlers.get(normalised)
+    if handler is None:
+        raise StartTLSUnsupported(f"unsupported STARTTLS protocol: {normalised}")
+    sock.settimeout(TIMEOUT)
+    handler(sock)
+
+
+LEGACY_TLS_VERSIONS = ("tls10", "tls11")
+
+
+def classify_legacy_tls_error(exc: BaseException) -> str:
+    """Separate a local OpenSSL limitation from a remote protocol refusal."""
+    if isinstance(exc, LocalTLSUnsupported):
+        return "local_unsupported"
+    text = f"{getattr(exc, 'reason', '')} {exc}".lower()
+    local_markers = (
+        "no protocols available",
+        "unsupported protocol",
+        "unknown protocol",
+        "no ciphers available",
+        "no cipher match",
+    )
+    if any(marker in text for marker in local_markers):
+        return "local_unsupported"
+    return "not_supported"
+
+
+def _legacy_context(version_name: str) -> ssl.SSLContext:
+    version_name = version_name.lower()
+    if version_name not in LEGACY_TLS_VERSIONS:
+        raise LocalTLSUnsupported(f"unknown legacy TLS version: {version_name}")
+    try:
+        version = getattr(
+            ssl.TLSVersion,
+            "TLSv1" if version_name == "tls10" else "TLSv1_1",
+        )
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.minimum_version = version
+        context.maximum_version = version
+        return context
+    except (AttributeError, ValueError, ssl.SSLError) as exc:
+        raise LocalTLSUnsupported(str(exc) or "legacy TLS is disabled locally") from exc
+
+
+def _legacy_handshake(
+    host: str,
+    port: int,
+    version_name: str,
+    *,
+    tls_mode: str = "direct",
+    protocol: str | None = None,
+) -> None:
+    context = _legacy_context(version_name)
+    sock = _open_socket(host, port, tls_mode, protocol)
+    try:
+        with context.wrap_socket(sock, server_hostname=host):
+            return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def probe_legacy_version(
+    host: str,
+    port: int,
+    version_name: str,
+    *,
+    tls_mode: str = "direct",
+    protocol: str | None = None,
+    handshake: Callable[..., None] | None = None,
+) -> str:
+    handshake = handshake or _legacy_handshake
+    if version_name not in LEGACY_TLS_VERSIONS:
+        return "local_unsupported"
+    try:
+        handshake(
+            host,
+            port,
+            version_name,
+            tls_mode=tls_mode,
+            protocol=protocol,
+        )
+    except LocalTLSUnsupported:
+        return "local_unsupported"
+    except ssl.SSLError as exc:
+        return classify_legacy_tls_error(exc)
+    except (socket.timeout, TimeoutError):
+        return "unknown"
+    except OSError:
+        return "unknown"
+    except ValueError:
+        return "local_unsupported"
+    return "supported"
+
+
+def check_legacy_tls(
+    host: str,
+    port: int,
+    *,
+    tls_mode: str = "direct",
+    protocol: str | None = None,
+    handshake: Callable[..., None] | None = None,
+) -> dict:
+    return {
+        "checked": True,
+        "tls10": probe_legacy_version(
+            host, port, "tls10", tls_mode=tls_mode, protocol=protocol, handshake=handshake
+        ),
+        "tls11": probe_legacy_version(
+            host, port, "tls11", tls_mode=tls_mode, protocol=protocol, handshake=handshake
+        ),
+        "note": (
+            "local_unsupported means this machine's OpenSSL/Python cannot try the "
+            "protocol; it is not evidence about the server. not_supported and "
+            "supported are remote outcomes."
+        ),
+    }
+
+
+def _not_checked_legacy_tls() -> dict:
+    return {"checked": False, "tls10": "not_checked", "tls11": "not_checked"}
+
+
 # ── TLS probing ───────────────────────────────────────────────────────────────
 
 
@@ -381,6 +765,8 @@ class TLSProbe:
     verification_error: str | None = None
     chain_der: list[bytes] = field(default_factory=list)
     chain_source: str = "leaf"
+    tls_mode: str = "direct"
+    starttls_protocol: str | None = None
 
 
 def _client_context(verify: bool) -> ssl.SSLContext:
@@ -435,14 +821,46 @@ def _socket_chain(ssock: ssl.SSLSocket, verified: bool) -> tuple[list[bytes], st
     return der_chain, "verified" if verified else "unverified"
 
 
-def _handshake(host: str, port: int, verify: bool) -> TLSProbe:
+def _open_socket(
+    host: str,
+    port: int,
+    tls_mode: str = "direct",
+    protocol: str | None = None,
+) -> socket.socket:
+    sock = socket.create_connection((host, port), timeout=TIMEOUT)
+    if tls_mode == "starttls":
+        try:
+            _starttls_exchange(sock, protocol)
+        except BaseException:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+    return sock
+
+
+def _handshake(
+    host: str,
+    port: int,
+    verify: bool,
+    *,
+    tls_mode: str = "direct",
+    starttls_protocol: str | None = None,
+) -> TLSProbe:
     context = _client_context(verify)
-    with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
+    sock = _open_socket(host, port, tls_mode, starttls_protocol)
+    try:
         with context.wrap_socket(sock, server_hostname=host) as ssock:
             der = ssock.getpeercert(binary_form=True)
             tls_version = ssock.version()
             cipher_info = ssock.cipher()
             chain_der, chain_source = _socket_chain(ssock, verify)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     if not der:
         raise ssl.SSLError("server did not present a certificate")
@@ -453,7 +871,37 @@ def _handshake(host: str, port: int, verify: bool) -> TLSProbe:
         trusted=verify,
         chain_der=chain_der,
         chain_source=chain_source,
+        tls_mode=tls_mode,
+        starttls_protocol=starttls_protocol if tls_mode == "starttls" else None,
     )
+
+
+def _probe_with_fallback(
+    host: str,
+    port: int,
+    *,
+    tls_mode: str = "direct",
+    starttls_protocol: str | None = None,
+) -> TLSProbe:
+    try:
+        return _handshake(
+            host,
+            port,
+            verify=True,
+            tls_mode=tls_mode,
+            starttls_protocol=starttls_protocol,
+        )
+    except ssl.SSLCertVerificationError as exc:
+        probe = _handshake(
+            host,
+            port,
+            verify=False,
+            tls_mode=tls_mode,
+            starttls_protocol=starttls_protocol,
+        )
+        probe.trusted = False
+        probe.verification_error = str(exc)
+        return probe
 
 
 def probe_endpoint(host: str, port: int) -> TLSProbe:
@@ -466,13 +914,17 @@ def probe_endpoint(host: str, port: int) -> TLSProbe:
     and the original verification error is preserved. Other TLS/socket errors
     propagate to the caller, which maps them to a status.
     """
-    try:
-        return _handshake(host, port, verify=True)
-    except ssl.SSLCertVerificationError as exc:
-        probe = _handshake(host, port, verify=False)
-        probe.trusted = False
-        probe.verification_error = str(exc)
-        return probe
+    return _probe_with_fallback(host, port, tls_mode="direct")
+
+
+def probe_starttls(host: str, port: int, protocol: str | None = "smtp") -> TLSProbe:
+    """Probe a STARTTLS service (SMTP/IMAP/POP3), not an implicit TLS socket."""
+    return _probe_with_fallback(
+        host,
+        port,
+        tls_mode="starttls",
+        starttls_protocol=protocol or "smtp",
+    )
 
 
 # ── Result assembly ───────────────────────────────────────────────────────────
@@ -548,18 +1000,51 @@ def _base_result(domain: str, host: str, port: int) -> dict:
         "key_type": None,
         "key_size": None,
         "key_curve": None,
+        "key_strength": None,
         "not_before": None,
         "not_after": None,
         "fingerprint_sha256": None,
         "serial_number": None,
         "tls_version": None,
         "cipher": None,
+        "tls_mode": "direct",
+        "starttls_protocol": None,
+        "https": port == DEFAULT_PORT,
         "chain": [],
         "chain_length": 0,
         "chain_source": None,
+        "dns_name": None,
+        "dns": {
+            "checked": False,
+            "name": None,
+            "ns": {"status": "not_checked", "records": [], "error": None},
+            "caa": {"status": "not_checked", "records": [], "error": None},
+            "dnssec": {
+                "status": "not_checked",
+                "validated": False,
+                "records": [],
+                "signature_count": 0,
+                "error": None,
+            },
+            "error": None,
+        },
+        "hsts": _hsts_not_applicable(),
+        "legacy_tls": _not_checked_legacy_tls(),
         # Honest capability reporting: this checker never requests revocation.
         "revocation_checked": False,
         "revocation_status": "not_checked",
+        "revocation_supported": False,
+        "revocation": {
+            "checked": False,
+            "supported": False,
+            "status": "not_checked",
+            "method": None,
+            "error": None,
+            "note": (
+                "OCSP/CRL revocation verification is not implemented; this "
+                "checker does not claim a revocation result."
+            ),
+        },
     }
 
 
@@ -582,6 +1067,7 @@ def _apply_probe(result: dict, probe: TLSProbe, match_host: str, now: datetime.d
     result["trusted_chain"] = probe.trusted
     result["tls_version"] = probe.tls_version
     result["cipher"] = probe.cipher
+
     if probe.verification_error and not result["chain_error"]:
         result["chain_error"] = _trim(probe.verification_error)
 
@@ -598,8 +1084,18 @@ def _apply_probe(result: dict, probe: TLSProbe, match_host: str, now: datetime.d
     result["error"] = error
 
 
-def _check_target(host: str, port: int, result: dict) -> dict:
-    probe = probe_endpoint(host, port)
+def _check_target(
+    host: str,
+    port: int,
+    result: dict,
+    *,
+    tls_mode: str = "direct",
+    starttls_protocol: str | None = None,
+) -> dict:
+    if tls_mode == "starttls":
+        probe = probe_starttls(host, port, starttls_protocol)
+    else:
+        probe = probe_endpoint(host, port)
     _apply_probe(result, probe, match_host=host)
     return result
 
@@ -627,8 +1123,114 @@ def _attach_www_fallback(result: dict, host: str, port: int) -> None:
     result["fallback"] = fallback
 
 
-def check_ssl(domain: str) -> dict:
-    """Check the TLS endpoint named by ``domain`` (``host`` or ``host:port``)."""
+def _not_checked_dns(name: str | None) -> dict:
+    return {
+        "checked": False,
+        "name": name,
+        "ns": {"status": "not_checked", "records": [], "error": None},
+        "caa": {"status": "not_checked", "records": [], "error": None},
+        "dnssec": {
+            "status": "not_checked",
+            "validated": False,
+            "records": [],
+            "signature_count": 0,
+            "error": None,
+        },
+        "error": None,
+    }
+
+
+def _failed_dns(name: str | None, exc: BaseException) -> dict:
+    result = _not_checked_dns(name)
+    error = _trim(str(exc), 180) or "DNS diagnostics failed"
+    result.update({"checked": False, "error": error})
+    for record in ("ns", "caa", "dnssec"):
+        result[record]["status"] = "unknown"
+        result[record]["error"] = error
+    return result
+
+
+def _hsts_disabled() -> dict:
+    return {
+        "applicable": True,
+        "checked": False,
+        "present": None,
+        "valid": None,
+        "max_age": None,
+        "include_subdomains": None,
+        "preload": None,
+        "error": None,
+    }
+
+
+def _apply_configured_diagnostics(
+    result: dict,
+    host: str,
+    port: int,
+    target: Target | None,
+) -> None:
+    """Attach diagnostics only for a configured target, never in legacy mode."""
+    if target is None:
+        result["https"] = port == DEFAULT_PORT
+        return
+
+    result.update(target.connection_metadata())
+    dns_name = target.dns_name_value
+    result["dns_name"] = dns_name
+
+    if target.check_dns:
+        try:
+            result["dns"] = diagnose_dns(dns_name)
+        except Exception as exc:  # diagnostics must not abort the TLS verdict
+            result["dns"] = _failed_dns(dns_name, exc)
+    else:
+        result["dns"] = _not_checked_dns(dns_name)
+
+    if target.is_https:
+        if target.check_hsts:
+            try:
+                result["hsts"] = check_hsts(host, port, applicable=True)
+            except Exception as exc:
+                result["hsts"] = _hsts_disabled()
+                result["hsts"].update(
+                    {
+                        "checked": True,
+                        "present": False,
+                        "valid": False,
+                        "error": _trim(str(exc), 180) or "HSTS check failed",
+                    }
+                )
+        else:
+            result["hsts"] = _hsts_disabled()
+    else:
+        result["hsts"] = _hsts_not_applicable()
+
+    if target.check_legacy_tls:
+        try:
+            result["legacy_tls"] = check_legacy_tls(
+                host,
+                port,
+                tls_mode=target.tls_mode,
+                protocol=target.starttls_protocol,
+            )
+        except Exception:
+            result["legacy_tls"] = {
+                "checked": True,
+                "tls10": "unknown",
+                "tls11": "unknown",
+                "note": "Legacy TLS capability probe failed locally.",
+            }
+    else:
+        result["legacy_tls"] = _not_checked_legacy_tls()
+
+
+def check_ssl(domain: str, *, target: Target | None = None) -> dict:
+    """Check the TLS endpoint named by ``domain`` (``host`` or ``host:port``).
+
+    ``target`` supplies unified-config options (STARTTLS mode, DNS/HSTS/legacy
+    diagnostics). Without it the legacy direct-TLS behaviour is unchanged and
+    no extra DNS/HTTP traffic is made.
+    """
     endpoint = parse_endpoint(domain)
     if endpoint is None:
         clean = (domain or "").strip() or "empty entry"
@@ -640,35 +1242,52 @@ def check_ssl(domain: str) -> dict:
     host, port = endpoint
     canonical = format_endpoint(host, port)
     result = _base_result(canonical, host, port)
+    tls_mode = target.tls_mode if target is not None else "direct"
+    starttls_protocol = target.starttls_protocol if target is not None else None
+    if target is not None:
+        result.update(target.connection_metadata())
+        result["dns_name"] = target.dns_name_value
 
     try:
-        return _check_target(host, port, result)
+        _check_target(
+            host,
+            port,
+            result,
+            tls_mode=tls_mode,
+            starttls_protocol=starttls_protocol,
+        )
 
     except ssl.SSLCertVerificationError as exc:  # defensive: probe already handles this
         result["status"] = "invalid"
         result["error"] = f"Certificate verification failed: {_trim(str(exc), 180)}"
         result["chain_error"] = _trim(str(exc))
         result["trusted_chain"] = False
-        return result
 
     except ssl.SSLError as exc:
         # Retry once: transient handshake failures are common.
         try:
-            return _check_target(host, port, result)
+            _check_target(
+                host,
+                port,
+                result,
+                tls_mode=tls_mode,
+                starttls_protocol=starttls_protocol,
+            )
         except Exception:
-            pass
-        result["status"] = "ssl_error"
-        result["error"] = f"SSL error: {_trim(str(exc), 120)}"
+            result["status"] = "ssl_error"
+            result["error"] = f"SSL error: {_trim(str(exc), 120)}"
 
     except (socket.timeout, TimeoutError):
         result["status"] = "timeout"
         result["error"] = "Connection timed out"
-        _attach_www_fallback(result, host, port)
+        if tls_mode == "direct":
+            _attach_www_fallback(result, host, port)
 
     except socket.gaierror as exc:
         result["status"] = "dns_error"
         result["error"] = f"DNS error: {_trim(str(exc), 120)}"
-        _attach_www_fallback(result, host, port)
+        if tls_mode == "direct":
+            _attach_www_fallback(result, host, port)
 
     except ConnectionRefusedError:
         result["status"] = "no_https"
@@ -678,6 +1297,7 @@ def check_ssl(domain: str) -> dict:
         result["status"] = "error"
         result["error"] = _trim(str(exc), 120)
 
+    _apply_configured_diagnostics(result, host, port, target)
     return result
 
 
@@ -724,26 +1344,68 @@ def build_output(domains: list[str], results: list[dict]) -> dict:
     }
 
 
-def main() -> None:
-    print(f"Loading domains from {DOMAIN_FILE}...")
-    domains = load_domains(DOMAIN_FILE)
-    print(f"Found {len(domains)} unique domains. Checking SSL certificates...")
+def load_monitor_endpoints(
+    config_path: str | Path | None = None,
+) -> list[tuple[str, Target]]:
+    """Return ``(endpoint, target)`` rows from the unified or legacy config."""
+    loaded = load_config(config_path)
+    endpoints = list(loaded.ssl_endpoints())
+    if not endpoints:
+        raise ConfigError("configuration contains no SSL targets")
+    return endpoints
+
+
+def apply_public_metadata(result: dict, target: Target | None) -> dict:
+    """Attach only tags/group. Owner and notes never enter a result file."""
+    if target is not None:
+        result.update(target.public_metadata())
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Check TLS certificates for CertiWatch.")
+    parser.add_argument("--config", default=None, help=f"default: ./{CONFIG_FILE}")
+    parser.add_argument("--ssl-conf", default=DOMAIN_FILE, help="legacy plain-text input")
+    parser.add_argument("--output", default=OUTPUT_FILE)
+    args = parser.parse_args(argv)
+
+    try:
+        if args.config is not None or Path(CONFIG_FILE).exists():
+            source = args.config or CONFIG_FILE
+            print(f"Loading targets from {source}...")
+            entries = load_monitor_endpoints(args.config)
+        else:
+            print(f"Loading domains from {args.ssl_conf} (legacy)...")
+            entries = [(domain, None) for domain in load_domains(args.ssl_conf)]
+    except (ConfigError, OSError) as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    if not entries:
+        print("No SSL targets configured.", file=sys.stderr)
+        return 1
+
+    print(f"Found {len(entries)} unique endpoints. Checking SSL certificates...")
 
     results: list[dict] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_domain = {executor.submit(check_ssl, domain): domain for domain in domains}
+        future_to_entry = {
+            executor.submit(check_ssl, endpoint, target=target): (endpoint, target)
+            for endpoint, target in entries
+        }
         completed = 0
-        for future in concurrent.futures.as_completed(future_to_domain):
+        for future in concurrent.futures.as_completed(future_to_entry):
+            endpoint, target = future_to_entry[future]
             try:
                 result = future.result()
             except Exception as exc:  # never lose the whole run to one target
-                domain = future_to_domain[future]
-                endpoint = parse_endpoint(domain) or (domain, DEFAULT_PORT)
+                parsed = parse_endpoint(endpoint) or (endpoint, DEFAULT_PORT)
                 result = _base_result(
-                    format_endpoint(*endpoint), endpoint[0], endpoint[1]
+                    format_endpoint(*parsed), parsed[0], parsed[1]
                 )
                 result["status"] = "error"
                 result["error"] = f"Unexpected error: {_trim(str(exc), 120)}"
+            apply_public_metadata(result, target)
             results.append(result)
             completed += 1
             status_icon = {
@@ -760,20 +1422,21 @@ def main() -> None:
             days_str = f"{days}d" if days is not None else "N/A"
             trust = "trusted" if result.get("trusted_chain") else "untrusted"
             print(
-                f"[{completed:3d}/{len(domains)}] {status_icon} {result['domain']:<45} "
+                f"[{completed:3d}/{len(entries)}] {status_icon} {result['domain']:<45} "
                 f"{result['provider']:<25} expires: {result['expires_on']}  "
                 f"({days_str}, {trust})"
             )
 
     results.sort(key=sort_key)
-    output = build_output(domains, results)
-    write_json_atomic(OUTPUT_FILE, output)
+    output = build_output([endpoint for endpoint, _ in entries], results)
+    write_json_atomic(args.output, output)
 
-    print(f"\nResults saved to {OUTPUT_FILE}")
+    print(f"\nResults saved to {args.output}")
     print(f"  Valid:   {output['valid']}")
     print(f"  Expired: {output['expired']}")
     print(f"  Errors:  {output['errors']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

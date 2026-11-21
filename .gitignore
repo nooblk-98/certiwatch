@@ -24,6 +24,12 @@ dist.staging/
 /ssl_results.json
 /domain_results.json
 
+# Monitoring lifecycle state. history.json is public but regenerated from the
+# result files; alert state is private and must never be committed or published.
+/history.json
+/.certiwatch/
+/feeds/
+
 # Cloudflare Pages/Wrangler local state
 .wrangler/
 

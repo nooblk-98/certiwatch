@@ -244,16 +244,16 @@ test("URL hash state round-trips and tolerates bad values", () => {
   const hash = app.buildHashState({ tab: "domain", filter: "soon", q: "face book", sort: "domain_asc" });
   assert.equal(hash, "#tab=domain&filter=soon&q=face+book&sort=domain_asc");
   assert.deepEqual(app.parseHashState(hash), {
-    tab: "domain", filter: "soon", q: "face book", sort: "domain_asc"
+    tab: "domain", filter: "soon", q: "face book", sort: "domain_asc", tag: "", group: ""
   });
   assert.deepEqual(app.parseHashState("#domain"), {
-    tab: "domain", filter: "all", q: "", sort: "days_asc"
+    tab: "domain", filter: "all", q: "", sort: "days_asc", tag: "", group: ""
   });
   assert.deepEqual(app.parseHashState("#filter=soon"), {
-    tab: "ssl", filter: "soon", q: "", sort: "days_asc"
+    tab: "ssl", filter: "soon", q: "", sort: "days_asc", tag: "", group: ""
   });
   assert.deepEqual(app.parseHashState("#tab=ssl&filter=bogus&sort=bogus"), {
-    tab: "ssl", filter: "all", q: "", sort: "days_asc"
+    tab: "ssl", filter: "all", q: "", sort: "days_asc", tag: "", group: ""
   });
   assert.equal(app.buildHashState({ tab: "ssl", filter: "bogus", sort: "bogus" }), "#ssl");
 });
@@ -295,4 +295,250 @@ test("metadata is present for accessible tabs, status and exports", () => {
   assert.match(html, /id="ssl-error"/);
   assert.match(html, /id="ssl-retry"/);
   assert.match(html, /data-f="soon"/);
+});
+
+test("optional tags and group are cleaned, deduplicated and filter the table", () => {
+  const ssl = app.normalizeSslRow({
+    domain: "api.example.com",
+    status: "valid",
+    days_left: 50,
+    tags: ["prod", "Prod", "api", "", 7, null],
+    group: "Platform"
+  });
+  assert.deepEqual(ssl.tags, ["prod", "api", "7"]);
+  assert.equal(ssl.group, "Platform");
+  assert.equal(app.matchesScope(ssl, "PROD", ""), true);
+  assert.equal(app.matchesScope(ssl, "", "platform"), true);
+  assert.equal(app.matchesScope(ssl, "staging", ""), false);
+  assert.equal(app.matchesScope(ssl, "", "Finance"), false);
+
+  const domain = app.normalizeDomainRow({ domain: "example.lk", status: "active", days_left: 60, tags: ["prod"], group: "Platform" });
+  assert.deepEqual(domain.tags, ["prod"]);
+  assert.equal(app.normalizeSslRow({ domain: "x.example", status: "valid", tags: "prod" }).tags.length, 0);
+
+  const rows = [
+    ssl,
+    app.normalizeSslRow({ domain: "web.example.com", status: "valid", days_left: 80, tags: ["prod"], group: "Web" }),
+    app.normalizeSslRow({ domain: "old.example.com", status: "valid", days_left: 90, tags: ["staging"], group: "Web" })
+  ];
+  assert.deepEqual(
+    app.filterAndSort("ssl", rows, { filter: "all", q: "", sort: "domain_asc", tag: "prod" }).map((row) => row.domain),
+    ["api.example.com", "web.example.com"]
+  );
+  assert.deepEqual(
+    app.filterAndSort("ssl", rows, { filter: "all", q: "", sort: "domain_asc", group: "Web" }).map((row) => row.domain),
+    ["old.example.com", "web.example.com"]
+  );
+  assert.deepEqual(
+    app.filterAndSort("ssl", rows, { filter: "all", q: "platform", sort: "domain_asc" }).map((row) => row.domain),
+    ["api.example.com"]
+  );
+});
+
+test("scope values, options and hash state stay in sync", () => {
+  assert.equal(app.scopeValue("prod", ""), "tag:prod");
+  assert.equal(app.scopeValue("", "Platform"), "group:Platform");
+  assert.equal(app.scopeValue("", ""), "");
+  assert.deepEqual(app.parseScopeValue("tag:prod"), { tag: "prod", group: "" });
+  assert.deepEqual(app.parseScopeValue("group:Platform"), { tag: "", group: "Platform" });
+  assert.deepEqual(app.parseScopeValue("bogus"), { tag: "", group: "" });
+
+  const rows = [
+    { tags: ["prod", "api"], group: "Platform" },
+    { tags: ["prod"], group: "Web" },
+    { tags: [], group: "" }
+  ];
+  assert.deepEqual(app.collectScopes(rows), {
+    tags: [{ name: "api", count: 1 }, { name: "prod", count: 2 }],
+    groups: [{ name: "Platform", count: 1 }, { name: "Web", count: 1 }]
+  });
+
+  const tagHash = app.buildHashState({ tab: "ssl", filter: "all", q: "", sort: "days_asc", tag: "prod", group: "Platform" });
+  assert.equal(tagHash, "#tag=prod");
+  assert.deepEqual(app.parseHashState(tagHash), {
+    tab: "ssl", filter: "all", q: "", sort: "days_asc", tag: "prod", group: ""
+  });
+  const groupHash = app.buildHashState({ tab: "domain", filter: "all", q: "", sort: "days_asc", tag: "", group: "Platform" });
+  assert.equal(groupHash, "#tab=domain&group=Platform");
+  assert.deepEqual(app.parseHashState(groupHash), {
+    tab: "domain", filter: "all", q: "", sort: "days_asc", tag: "", group: "Platform"
+  });
+});
+
+test("provider and registrar distribution ranks buckets and folds the tail", () => {
+  const dist = app.summarizeBy([
+    { provider: "A" }, { provider: "A" }, { provider: "B" }, { provider: "" }
+  ], "provider", 2);
+  assert.equal(dist.total, 4);
+  assert.deepEqual(dist.buckets, [
+    { name: "A", count: 2, share: 0.5 },
+    { name: "B", count: 1, share: 0.25 },
+    { name: "Other", count: 1, share: 0.25, other: true }
+  ]);
+
+  const missing = app.summarizeBy([{ registrar: "" }], "registrar");
+  assert.equal(missing.total, 1);
+  assert.equal(missing.buckets[0].name, "Not recorded");
+  assert.equal(app.summarizeBy([], "provider").buckets.length, 0);
+});
+
+test("column header clicks use the same sort values as the select", () => {
+  assert.equal(app.nextSortValue("days_asc", "days_asc", "days_desc"), "days_desc");
+  assert.equal(app.nextSortValue("days_desc", "days_asc", "days_desc"), "days_asc");
+  assert.equal(app.nextSortValue("days_asc", "domain_asc", ""), "domain_asc");
+  assert.equal(app.nextSortValue("domain_asc", "domain_asc", ""), "domain_asc");
+});
+
+test("optional history is validated, sorted and never blocks current results", () => {
+  const parsed = app.normalizeHistory({
+    snapshots: [
+      {
+        date: "2026-11-20",
+        ssl: [{ domain: "a.example", days_left: 10, status: "valid", fingerprint_sha256: "AAA" }],
+        domains: [{ domain: "a.example", days_left: 20, status: "active" }]
+      },
+      {
+        date: "2026-11-18",
+        ssl: [{ domain: "a.example", days_left: 40, status: "valid", fingerprint_sha256: "BBB" }],
+        domains: []
+      },
+      { date: "not-a-date", ssl: [] }
+    ]
+  });
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.skipped, 1);
+  assert.deepEqual(parsed.snapshots.map((snapshot) => snapshot.date), ["2026-11-18", "2026-11-20"]);
+  assert.equal(parsed.snapshots[0].ssl[0].fingerprint_sha256, "bbb");
+  assert.equal(parsed.snapshots[1].domains[0].days_left, 20);
+
+  assert.equal(app.normalizeHistory({ snapshots: [] }).ok, true);
+  assert.equal(app.normalizeHistory([]).ok, false);
+  assert.equal(app.normalizeHistory({ snapshots: "nope" }).ok, false);
+  assert.equal(app.normalizeHistory({ snapshots: [{ date: "bad" }] }).reason, "no snapshot had a valid date");
+});
+
+test("history series counts due-soon rows and marks renewals", () => {
+  const series = app.buildHistorySeries("ssl", [
+    {
+      date: "2026-11-18",
+      ssl: [
+        { domain: "a.example", days_left: 10, status: "valid", fingerprint_sha256: "aa" },
+        { domain: "b.example", days_left: 5, status: "valid", fingerprint_sha256: "bb" }
+      ]
+    },
+    {
+      date: "2026-11-19",
+      ssl: [
+        { domain: "a.example", days_left: 60, status: "valid", fingerprint_sha256: "aa" },
+        { domain: "b.example", days_left: 4, status: "valid", fingerprint_sha256: "cc" }
+      ]
+    },
+    {
+      date: "2026-11-20",
+      ssl: [
+        { domain: "a.example", days_left: 59, status: "valid", fingerprint_sha256: "aa" },
+        { domain: "b.example", days_left: 3, status: "valid", fingerprint_sha256: "cc" }
+      ]
+    }
+  ]);
+  assert.deepEqual(series.points.map((point) => point.dueSoon), [2, 1, 1]);
+  assert.deepEqual(series.points.map((point) => point.total), [2, 2, 2]);
+  assert.deepEqual(series.renewals, [
+    { date: "2026-11-19", domains: ["a.example", "b.example"] }
+  ]);
+
+  const domains = app.buildHistorySeries("domain", [
+    { date: "2026-11-18", domains: [{ domain: "example.lk", days_left: 5, status: "active" }] },
+    { date: "2026-11-19", domains: [{ domain: "example.lk", days_left: 365, status: "active" }] }
+  ]);
+  assert.deepEqual(domains.renewals, [{ date: "2026-11-19", domains: ["example.lk"] }]);
+});
+
+test("sparkline geometry keeps points inside the drawing box", () => {
+  const geometry = app.sparklineGeometry([
+    { date: "2026-11-18", dueSoon: 0 },
+    { date: "2026-11-19", dueSoon: 5 },
+    { date: "2026-11-20", dueSoon: 2 }
+  ], 100, 50, 10);
+  assert.equal(geometry.max, 5);
+  assert.equal(geometry.coords.length, 3);
+  assert.equal(geometry.coords[0].x, 10);
+  assert.equal(geometry.coords[2].x, 90);
+  assert.equal(geometry.coords[0].y, 40);
+  assert.equal(geometry.coords[1].y, 10);
+  assert.ok(geometry.coords.every((coord) => coord.y >= 10 && coord.y <= 40));
+  assert.match(geometry.path, /^M10 40 L50 10 L90 28$/);
+  assert.deepEqual(app.sparklineGeometry([]).coords, []);
+});
+
+test("fetchJson times out a stalled body and can be retried", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (url, options) => {
+    calls += 1;
+    if (calls === 1) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => new Promise((resolve, reject) => {
+          const signal = options && options.signal;
+          if (!signal) return;
+          signal.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          }, { once: true });
+        })
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: async () => ({ runs: 2 }) });
+  };
+  try {
+    await assert.rejects(app.fetchJson("history.json", 15), (error) => {
+      assert.equal(error.code, "timeout");
+      return true;
+    });
+    assert.deepEqual(await app.fetchJson("history.json", 200), { runs: 2 });
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("fetchJson reports HTTP failures with a retryable code", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, status: 404 });
+  try {
+    await assert.rejects(app.fetchJson("history.json"), (error) => {
+      assert.equal(error.code, "http-404");
+      return true;
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("new controls and optional-history surfaces are present and accessible", () => {
+  assert.match(html, /id="refresh-btn"/);
+  assert.match(html, /id="ssl-scope"/);
+  assert.match(html, /id="dom-scope"/);
+  assert.match(html, /for="ssl-scope"/);
+  assert.match(html, /for="dom-scope"/);
+  assert.match(html, /data-sort-field="days"/);
+  assert.match(html, /data-sort-asc="days_asc"/);
+  assert.match(html, /data-sort-desc="days_desc"/);
+  assert.match(html, /aria-sort="none"/);
+  assert.match(html, /id="ssl-dist-list"/);
+  assert.match(html, /id="dom-dist-list"/);
+  assert.match(html, /id="ssl-history-chart"/);
+  assert.match(html, /id="dom-history-chart"/);
+  assert.match(html, /id="ssl-note-action"/);
+  assert.match(html, /id="dom-note-action"/);
+  assert.doesNotMatch(html, /\son[a-z]+=/i);
+
+  assert.match(css, /th\[aria-sort="ascending"\]/);
+  assert.match(css, /\.sort-arrow::after/);
+  assert.match(css, /\.dist-list/);
+  assert.match(css, /\.spark-line/);
+  assert.match(css, /\.history-table-wrap table \{ display: table; \}/);
 });
