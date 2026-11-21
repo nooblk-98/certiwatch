@@ -14,6 +14,7 @@ import json
 import os
 import re
 import socket
+import tempfile
 import threading
 import time
 import urllib.error
@@ -452,14 +453,13 @@ def check_domain(domain: str) -> dict:
 
     if domain.endswith(".lk"):
         result["registrar"] = "domains.lk"
-        throttle_request()
+        # The .lk helper applies its own adaptive spacing; throttling here as
+        # well would add a second fixed delay to every lookup.
         lk_value = get_lk_expiry_date(domain, verbose=False)
         expiry_dt = parse_date(lk_value)
         if expiry_dt is None:
-            if "not registered" in lk_value.lower():
-                result["status"] = "unknown"
-            else:
-                result["status"] = "unknown"
+            # No expiry exposed (not registered, API error or unknown domain).
+            result["status"] = "unknown"
             return result
 
         result["expiry_date"] = expiry_dt.strftime("%Y-%m-%d")
@@ -488,6 +488,29 @@ def choose_domain_file() -> str:
     if os.path.exists(DOMAIN_FILE):
         return DOMAIN_FILE
     return LEGACY_DOMAIN_FILE
+
+
+def write_json_atomic(path: str, payload: dict) -> None:
+    """Write JSON via a sibling temp file + rename.
+
+    A crashed or interrupted run must not leave a truncated result file for
+    the dashboard or the Pages build to consume.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def main() -> None:
@@ -537,8 +560,7 @@ def main() -> None:
         "results": results,
     }
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as handle:
-        json.dump(output, handle, indent=2)
+    write_json_atomic(OUTPUT_FILE, output)
 
     print(f"\nResults saved to {OUTPUT_FILE}")
     print(f"  Active:  {output['active']}")

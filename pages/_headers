@@ -1,0 +1,10 @@
+# Cloudflare Pages headers.
+# Copied to the root of the publish directory by scripts/build_dist.py.
+# The dashboard refetches these files on every load, so they must never be
+# served from a stale edge or browser cache.
+
+/ssl_results.json
+  Cache-Control: no-cache, must-revalidate
+
+/domain_results.json
+  Cache-Control: no-cache, must-revalidate

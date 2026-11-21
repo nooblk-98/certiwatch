@@ -12,9 +12,18 @@ ENV/
 # Build and packaging outputs
 build/
 dist/
+dist.staging/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+
+# Generated check results: produced by the scripts, published from dist/,
+# never committed. Regenerate locally or let CI do it.
+/ssl_results.json
+/domain_results.json
+
+# Cloudflare Pages/Wrangler local state
+.wrangler/
 
 # Environment and local secrets
 .env

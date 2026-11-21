@@ -2,33 +2,72 @@ name: SSL Certificate Check
 
 on:
   push:
-    branches: main
+    branches:
+      - main
+    # Only changes that alter what the dashboard checks, what it renders or
+    # what gets published re-run the checks and redeploy.
+    paths:
+      - "requirements.txt"
+      - "index.html"
+      - "app.js"
+      - "style.css"
+      - "ssl.conf"
+      - "domains.conf"
+      - "pages/_headers"
+      - "scripts/build_dist.py"
+      - "scripts/test_build_dist.py"
+      - "src/validate_conf.py"
+      - "src/ssl/scripts/**"
+      - "src/domain/scripts/**"
+      - ".github/workflows/ssl-check.yml"
   schedule:
-    # Runs every day at 06:00 Asia/Colombo (UTC+5:30) = 00:30 UTC
+    # Every day at 06:00 Asia/Colombo (UTC+5:30) = 00:30 UTC.
     - cron: "30 0 * * *"
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
+  workflow_dispatch:  # Manual run from the Actions tab.
 
+# The workflow reads the repository and publishes to Cloudflare Pages.
+# It never pushes results back, so the token has no write access.
 permissions:
   contents: read
+
+# Never let two runs race to publish the same Pages project. A queued run
+# waits for the current deploy instead of being cancelled mid-publish.
+concurrency:
+  group: certiwatch-pages
+  cancel-in-progress: false
 
 jobs:
   check-ssl:
     name: Check SSL Certificates
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verify required inputs
+        run: |
+          set -euo pipefail
+          status=0
+          for file in ssl.conf domains.conf index.html pages/_headers scripts/build_dist.py; do
+            if [ ! -s "$file" ]; then
+              echo "::error file=$file::Required input '$file' is missing or empty."
+              status=1
+            fi
+          done
+          exit "$status"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install dependencies
-        run: pip install cryptography
+        run: python -m pip install --disable-pip-version-check cryptography
 
       - name: Validate config files
+        # Auto-fixes the checkout copy only; results are never committed.
         run: python3 src/validate_conf.py --no-dns
 
       - name: Run SSL checker
@@ -37,9 +76,21 @@ jobs:
       - name: Run domain expiry checker
         run: python3 src/domain/scripts/check_domains.py
 
+      - name: Test the Pages bundle builder
+        run: python3 scripts/test_build_dist.py
+
+      - name: Build Pages bundle
+        # Allowlisted staging: only the dashboard, the two generated result
+        # files and _headers reach dist/. Fails on missing or empty inputs.
+        run: python3 scripts/build_dist.py --out dist
+
       - name: Deploy to Cloudflare Pages
+        if: github.ref == 'refs/heads/main'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy . --project-name=ssl-domain-monitor --branch=main
+          # Project name must match the published hostname (certiwatch.pages.dev).
+          # Override with the CLOUDFLARE_PAGES_PROJECT repository variable if the
+          # Cloudflare account still holds this project under another name.
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT || 'certiwatch' }} --branch=main
