@@ -411,6 +411,8 @@ jobs:
                           fail(f"symlink member {rel!r} is not permitted")
                       if mode not in (0, stat.S_IFREG):
                           fail(f"member {rel!r} is not a regular file")
+                      if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                          fail("ZIP member uses an unsupported compression method")
                       if info.flag_bits & 0x1:
                           fail(f"encrypted member {rel!r} is not permitted")
                       if info.file_size > MAX_FILE:

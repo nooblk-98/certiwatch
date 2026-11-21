@@ -838,6 +838,12 @@ def test_archive_rejects_too_many_members(tmp_path: Path) -> None:
     expect_archive_rejected(archive, tmp_path / "preview-bundle", "limit is 1500")
 
 
+def test_archive_rejects_unsupported_compression(tmp_path: Path) -> None:
+    archive = tmp_path / "lzma.zip"
+    write_zip(archive, [("index.html", b"<html></html>")], compression=zipfile.ZIP_LZMA)
+    expect_archive_rejected(archive, tmp_path / "out", "unsupported compression method")
+
+
 def test_archive_rejects_malformed_and_truncated_zips(tmp_path: Path) -> None:
     malformed = tmp_path / "malformed.zip"
     malformed.write_bytes(b"PK\x03\x04" + b"\0" * 100)
