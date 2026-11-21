@@ -262,10 +262,20 @@ KV failure behavior is deliberate:
 - a post-acknowledgement checkpoint failure can duplicate the acknowledged
   batch on the next run; it cannot lose it.
 
+Cloudflare limits writes to the same key to **one per second**. The checkpoint
+paces writes at that interval and retries HTTP 429 using `Retry-After`, with a
+bounded attempt count and maximum delay. The next Discord batch is not sent
+until the prior checkpoint PUT has been acknowledged; a failed or exhausted
+checkpoint stops the queue. A nameserver event may be large, so only its
+Discord display is shortened with an explicit omitted count; the complete list
+remains in the private event state.
+
 Messages are split into bounded batches of at most 2000 characters. Every event
-belongs to exactly one batch; the code refuses an oversized single event rather
-than silently truncating or dropping it. After each acknowledged batch, the
-local and remote states retain only the unacknowledged events.
+belongs to exactly one batch. A very large nameserver list is shortened only in
+the Discord display, with an explicit omitted count, while the complete list
+stays in the private event state; any other event that still cannot fit fails
+rather than being silently truncated or dropped. After each acknowledged batch,
+the local and remote states retain only the unacknowledged events.
 
 ## Discord delivery
 

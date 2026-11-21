@@ -945,6 +945,30 @@ def _short_fingerprint(value: Any) -> str:
     return text[:23] + "…" if len(text) > 23 else text
 
 
+# Display-only bounds for DNS sets. The full list stays in the private event;
+# only the Discord line is shortened so one large delegation cannot block the
+# rest of the queue.
+MAX_NAMESERVER_ITEMS = 8
+MAX_NAMESERVER_ITEM_CHARS = 80
+MAX_NAMESERVER_TEXT = 700
+
+
+def _bounded_nameservers(values: Any) -> str:
+    items = [str(item) for item in (values or [])]
+    if not items:
+        return "none"
+    shown = [
+        item[:MAX_NAMESERVER_ITEM_CHARS] for item in items[:MAX_NAMESERVER_ITEMS]
+    ]
+    omitted = len(items) - len(shown)
+    text = ", ".join(shown)
+    if omitted:
+        text += f" … (+{omitted} more)"
+    if len(text) > MAX_NAMESERVER_TEXT:
+        text = text[: MAX_NAMESERVER_TEXT - 1] + "…"
+    return text
+
+
 def _event_line(event: dict[str, Any]) -> str:
     domain = str(event.get("domain") or event.get("key") or "unknown")
     kind = str(event.get("kind") or "target").upper()
@@ -956,8 +980,8 @@ def _event_line(event: dict[str, Any]) -> str:
             f"({_short_fingerprint(event.get('from'))} -> {_short_fingerprint(event.get('to'))})"
         )
     if event.get("type") == "nameservers":
-        before = ", ".join(str(item) for item in event.get("from") or []) or "none"
-        after = ", ".join(str(item) for item in event.get("to") or []) or "none"
+        before = _bounded_nameservers(event.get("from"))
+        after = _bounded_nameservers(event.get("to"))
         return f"- DNS {domain}: nameservers changed ({before} -> {after})"
     if event.get("type") == "threshold":
         return (
@@ -1015,8 +1039,9 @@ def build_discord_batches(
 
     Discord limits a message's content to 2000 characters. Each batch is sent
     and acknowledged separately so the checkpoint can retain only the events
-    that have not been delivered. A single event line that cannot fit fails the
-    run before any send; it is never shortened.
+    that have not been delivered. Nameserver lines are bounded with an omitted
+    count while retaining the full private event. Any other single event line
+    that cannot fit fails the run before any send; it is never shortened.
     """
     sources = list(events)
     if not sources:

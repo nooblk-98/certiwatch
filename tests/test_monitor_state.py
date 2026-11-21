@@ -1075,3 +1075,79 @@ def test_each_acknowledged_batch_advances_the_checkpoint(tmp_path, monkeypatch):
         expected.append(remaining)
     assert [len(state["pending_events"]) for state in checkpoint.saved] == expected
     assert checkpoint.saved[-1]["pending_events"] == []
+
+
+def test_large_nameserver_event_is_bounded_but_private_state_is_complete():
+    before = [f"ns{index:03d}.example.test" for index in range(60)]
+    after = [f"new-{index:03d}.example.test" for index in range(60)]
+    event = {
+        "id": "event-ns",
+        "key": "ssl:example.test",
+        "kind": "ssl",
+        "domain": "example.test",
+        "type": "nameservers",
+        "from": before,
+        "to": after,
+        "date": "2026-11-21",
+    }
+    normal = make_event(0)
+
+    batches = ms.build_discord_batches([event, normal])
+    assert len(batches) >= 1
+    assert sum(len(batch.events) for batch in batches) == 2
+    assert all(len(batch.payload["content"]) <= ms.MAX_DISCORD_CONTENT for batch in batches)
+    content = "\n".join(batch.payload["content"] for batch in batches)
+    assert "more)" in content
+    # Display is shortened; the private event itself is untouched.
+    assert batches[0].events[0]["from"] == before
+    assert batches[0].events[0]["to"] == after
+    assert len(batches[0].events[0]["from"]) == 60
+    state = ms.finalize_alert_state(
+        {"version": 1, "updated_at": "2026-11-21T00:00:00Z", "observations": {}},
+        [event],
+        delivered=False,
+    )
+    assert len(state["pending_events"][0]["from"]) == 60
+
+
+def test_next_batch_waits_for_prior_checkpoint(tmp_path, monkeypatch):
+    _write_cli_inputs(tmp_path)
+    assert ms.main(_cli_args(tmp_path, transport="none")) == 0
+
+    events = [make_event(index) for index in range(80)]
+    state_path = tmp_path / "private" / "alert_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-11-20T00:00:00Z",
+                "observations": {},
+                "pending_events": events,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    order: list = []
+    checkpoint = RecordingCheckpoint(order)
+    transport = RecordingTransport(order)
+
+    class FakeWebhook:
+        @classmethod
+        def from_env(cls, timeout=15.0):
+            return transport
+
+    monkeypatch.setattr(ms, "DiscordWebhookTransport", FakeWebhook)
+    monkeypatch.setattr(ms, "checkpoint_from_args", lambda args: checkpoint)
+    code = ms.main(_cli_args(tmp_path, transport="discord", checkpoint="kv"))
+
+    assert code == 0
+    kinds = [item[0] for item in order]
+    assert kinds[0] == "checkpoint"
+    for index, kind in enumerate(kinds):
+        if kind == "send":
+            assert index > 0 and kinds[index - 1] == "checkpoint"
+    assert kinds[-1] == "checkpoint"
+    assert len([kind for kind in kinds if kind == "send"]) == len(
+        ms.build_discord_batches(events)
+    )

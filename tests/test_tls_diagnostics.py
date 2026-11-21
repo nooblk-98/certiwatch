@@ -147,6 +147,7 @@ def test_hsts_connection_uses_verified_context_and_configured_trust_store(monkey
     class FakeContext:
         check_hostname = False
         verify_mode = ssl.CERT_NONE
+        hostname_checks_common_name = True
 
     class FakeResponse:
         def getheaders(self):
@@ -192,6 +193,7 @@ def test_hsts_connection_uses_verified_context_and_configured_trust_store(monkey
     assert captured["port"] == 443
     assert context.check_hostname is True
     assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.hostname_checks_common_name is False
 
 
 class _HstsHandler(http.server.BaseHTTPRequestHandler):
@@ -247,6 +249,77 @@ def test_hsts_authenticates_trust_and_san_offline(tmp_path, ca_bundle, monkeypat
         thread.join(timeout=2)
 
     assert headers["strict-transport-security"] == "max-age=60"
+
+
+def test_hsts_authenticates_trust_and_dns_san_offline(tmp_path, ca_bundle, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root = build_cert(
+        common_name="CertiWatch Test Root",
+        key=root_key,
+        is_ca=True,
+        organization="CertiWatch Test CA",
+    )
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf = build_cert(
+        common_name="not-localhost.example",
+        key=leaf_key,
+        sans=dns_san("localhost"),
+        issuer_cert=root,
+        issuer_key=root_key,
+    )
+    monkeypatch.setattr(cs, "CA_FILE", ca_bundle(root))
+    server, thread = _start_https_hsts_server(leaf, leaf_key, tmp_path)
+    try:
+        headers = cs.fetch_https_headers("localhost", server.server_port)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert headers["strict-transport-security"] == "max-age=60"
+
+
+def test_hsts_trusted_loopback_cn_only_certificate_is_indeterminate(
+    tmp_path, ca_bundle, monkeypatch
+):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root = build_cert(
+        common_name="CertiWatch Test Root",
+        key=root_key,
+        is_ca=True,
+        organization="CertiWatch Test CA",
+    )
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    # Deliberately CN-only: no subjectAltName at all.
+    leaf = build_cert(
+        common_name="localhost",
+        key=leaf_key,
+        issuer_cert=root,
+        issuer_key=root_key,
+    )
+    monkeypatch.setattr(cs, "CA_FILE", ca_bundle(root))
+    server, thread = _start_https_hsts_server(leaf, leaf_key, tmp_path)
+    try:
+        with pytest.raises(ssl.SSLCertVerificationError):
+            cs.fetch_https_headers("localhost", server.server_port)
+        result = cs.check_hsts(
+            "localhost",
+            server.server_port,
+            applicable=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result["status"] == "indeterminate"
+    assert result["present"] is None
+    assert result["valid"] is None
+    assert result["enabled"] is None
 
 
 def test_hsts_hostname_mismatch_is_indeterminate(tmp_path, ca_bundle, monkeypatch):

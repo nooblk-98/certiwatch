@@ -531,12 +531,17 @@ or `--checkpoint kv` (CI). The workflow chooses `kv` only when
 otherwise. With delivery disabled, pending events are preserved rather than
 discarded; the backlog can grow while alerts are off and is bounded by the 2 MB
 KV state limit. A PUT failure, including a 404, is a checkpoint failure and
-sends nothing; a missing GET key is a first run.
+sends nothing; a missing GET key is a first run. Cloudflare limits writes to
+the same key to one per second, so checkpoint writes are paced at that interval.
+HTTP 429 is retried with `Retry-After` within a bounded attempt/delay budget;
+exhaustion stops the next Discord batch.
 
 Messages are split into bounded batches. Every event is sent exactly once per
 attempt, and after each acknowledged batch only the unacknowledged events remain
-in the local and remote state. An oversized single event fails the run rather
-than being truncated. The private state is never written to the repository, a
+in the local and remote state. A nameserver event shortens only its display
+with an explicit omitted count while retaining the complete private list; any
+other event that cannot fit fails rather than being truncated. The private
+state is never written to the repository, a
 Pages bundle, an Actions cache or an uploaded artifact.
 
 ### Required GitHub configuration

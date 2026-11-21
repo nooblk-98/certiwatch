@@ -232,3 +232,114 @@ def test_symlinked_destination_is_refused(monkeypatch, tmp_path):
 
     assert store.main(["pull", "--out", str(link)]) == 1
     assert not real.exists()
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class FakeSleep:
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.delays: list[float] = []
+
+    def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.clock.now += delay
+
+
+class SequenceRecorder:
+    def __init__(self, results: list[object]) -> None:
+        self.results = list(results)
+        self.requests = []
+
+    def __call__(self, request, timeout):
+        self.requests.append(request)
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def checkpoint_with_injection(clock: FakeClock, sleep: FakeSleep):
+    return store.KvCheckpoint(
+        account=ACCOUNT,
+        namespace=NAMESPACE,
+        key=store.DEFAULT_KEY,
+        token=TOKEN,
+        sleep=sleep,
+        clock=clock,
+    )
+
+
+def test_official_same_key_limit_is_one_write_per_second():
+    assert store.KV_SAME_KEY_WRITE_INTERVAL_SECONDS == 1.0
+
+
+def test_same_key_writes_are_paced(monkeypatch):
+    clock = FakeClock()
+    sleep = FakeSleep(clock)
+    recorder = SequenceRecorder([FakeResponse(b"", 200), FakeResponse(b"", 200)])
+    monkeypatch.setattr(store.urllib.request, "urlopen", recorder)
+
+    checkpoint = checkpoint_with_injection(clock, sleep)
+    checkpoint.save(STATE)
+    checkpoint.save(STATE)
+
+    assert len(recorder.requests) == 2
+    assert sleep.delays == [1.0]
+    assert clock.now == 1.0
+
+
+def test_429_retry_honours_retry_after_with_injected_sleep(monkeypatch):
+    clock = FakeClock()
+    sleep = FakeSleep(clock)
+    recorder = SequenceRecorder(
+        [
+            urllib.error.HTTPError(
+                f"{store.API_BASE}/x", 429, "rate limited", {"Retry-After": "2"}, None
+            ),
+            FakeResponse(b"", 200),
+        ]
+    )
+    monkeypatch.setattr(store.urllib.request, "urlopen", recorder)
+
+    checkpoint = checkpoint_with_injection(clock, sleep)
+    checkpoint.save(STATE)
+
+    assert len(recorder.requests) == 2
+    assert sleep.delays == [2.0]
+
+
+def test_429_without_retry_after_uses_bounded_backoff(monkeypatch):
+    clock = FakeClock()
+    sleep = FakeSleep(clock)
+    recorder = SequenceRecorder(
+        [
+            urllib.error.HTTPError(
+                f"{store.API_BASE}/x", 429, "rate limited", {}, None
+            ),
+            urllib.error.HTTPError(
+                f"{store.API_BASE}/x", 429, "rate limited", {}, None
+            ),
+        ]
+    )
+    monkeypatch.setattr(store.urllib.request, "urlopen", recorder)
+
+    checkpoint = store.KvCheckpoint(
+        account=ACCOUNT,
+        namespace=NAMESPACE,
+        key=store.DEFAULT_KEY,
+        token=TOKEN,
+        max_attempts=2,
+        sleep=sleep,
+        clock=clock,
+    )
+    with pytest.raises(store.StoreError, match="rate-limited"):
+        checkpoint.save(STATE)
+    assert len(recorder.requests) == 2
+    assert sleep.delays == [1.0]

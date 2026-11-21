@@ -497,6 +497,9 @@ def fetch_https_headers(host: str, port: int, *, timeout: float = TIMEOUT) -> di
     context = ssl.create_default_context(cafile=CA_FILE)
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED
+    # A Common Name is not a subjectAltName. OpenSSL's legacy CN fallback must
+    # not make a CN-only certificate authenticate the HSTS connection.
+    context.hostname_checks_common_name = False
     connection = http.client.HTTPSConnection(
         host,
         port,
