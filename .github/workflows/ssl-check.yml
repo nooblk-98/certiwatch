@@ -1,8 +1,16 @@
 name: CertiWatch checks
 
+# The workflow that owns production Cloudflare Pages deployment:
+#   * main -> production publish
+#
+# Previews are built by the secret-free preview-build.yml and published by
+# preview-publish.yml from the default branch, so no development branch and no
+# pull request can reach the production job. The preview pair supports two
+# levels under development/ (development/* and development/*/*); its publisher
+# re-checks the branch name. Pull requests use the dedicated, secret-free
+# pr-verify.yml workflow and never publish. Arbitrary feature branches, tags
+# and pull requests are not deployed.
 on:
-  # Pull requests use the dedicated, secret-free pr-verify.yml workflow. This
-  # production workflow is main/schedule/manual only.
   push:
     branches:
       - main
@@ -26,40 +34,43 @@ on:
   schedule:
     # Every day at 06:00 Asia/Colombo (UTC+5:30) = 00:30 UTC.
     - cron: "30 0 * * *"
-  workflow_dispatch:  # Manual run from the Actions tab.
+  workflow_dispatch:  # Manual run from the Actions tab; publishes from main only.
 
 # The workflow reads the repository and publishes to Cloudflare Pages.
 # It never pushes results back, so the token has no write access.
 permissions:
   contents: read
 
-# One publishing attempt per branch at a time. Superseded pull-request runs are
-# cancelled; a push or scheduled run on main waits instead of being killed
-# mid-publish.
+# One publishing attempt per branch at a time. A production run on main waits
+# instead of being killed mid-publish.
 concurrency:
   group: certiwatch-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   verify:
     name: Offline checks
     # Reusable and secret-free, so the dedicated PR workflow can run the same
-    # contract even while this production workflow is disabled.
+    # contract even while the production workflow is disabled.
     uses: ./.github/workflows/verify.yml
 
   publish:
-    name: Check certificates and publish
-    # Production only runs after the offline checks pass, from main. Pull
-    # requests and feature-branch dispatches never touch state, history or
-    # Cloudflare.
+    name: Production (main)
+    # Production runs only after the offline checks pass and only from main,
+    # whether the run was a push, the daily schedule or a manual dispatch.
     needs: verify
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
+    # Production credentials live only in this environment. Its deployment
+    # branch policy must allow main and nothing else, so a job on any other ref
+    # cannot read them even if the workflow file changes.
+    environment:
+      name: certiwatch-production
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
 
@@ -110,12 +121,50 @@ jobs:
           exit "$status"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.13"
 
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Verify production credentials
+        # Fail closed on a missing or mismatched account instead of deploying
+        # with whatever secret happens to be present. Values are never printed.
+        env:
+          PAGES_TOKEN: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_API_TOKEN }}
+          PAGES_ACCOUNT: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
+          TRUSTED_ACCOUNT: ${{ vars.CERTIWATCH_PRODUCTION_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAGES_TOKEN:-}" ] || [ -z "${PAGES_ACCOUNT:-}" ]; then
+            echo "::error::The certiwatch-production environment needs CERTIWATCH_PRODUCTION_PAGES_API_TOKEN and CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID secrets."
+            exit 1
+          fi
+          if [ -z "${TRUSTED_ACCOUNT:-}" ]; then
+            echo "::error::Repository variable CERTIWATCH_PRODUCTION_ACCOUNT_ID must name the production Cloudflare account."
+            exit 1
+          fi
+          if [ "$PAGES_ACCOUNT" != "$TRUSTED_ACCOUNT" ]; then
+            echo "::error::The production Pages account secret does not match the trusted CERTIWATCH_PRODUCTION_ACCOUNT_ID setting."
+            exit 1
+          fi
+
+      - name: Resolve Pages project
+        # The project name is optional production configuration. Validate it
+        # against a strict allowlist here, then interpolate only the validated
+        # value into the deploy command, so a repository variable can never
+        # smuggle extra shell arguments into the deploy step.
+        env:
+          PAGES_PROJECT: ${{ vars.CERTIWATCH_PRODUCTION_PAGES_PROJECT }}
+        run: |
+          set -euo pipefail
+          project="${PAGES_PROJECT:-certiwatch}"
+          if ! [[ "$project" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || [ "${#project}" -gt 58 ]; then
+            echo "::error::CERTIWATCH_PRODUCTION_PAGES_PROJECT must be 1-58 lowercase letters, digits or hyphens, starting and ending with a letter or digit."
+            exit 1
+          fi
+          printf 'CERTIWATCH_PAGES_PROJECT=%s\n' "$project" >> "$GITHUB_ENV"
 
       - name: Restore public history
         # Public data may use the Actions cache. The key is unique per run so a
@@ -123,7 +172,7 @@ jobs:
         # Caches unused for 7 days are evicted, and a repository's cache is
         # capped at 10 GB, so losing history never blocks a publish.
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: history.json
           key: certiwatch-history-${{ github.run_id }}-${{ github.run_attempt }}
@@ -145,21 +194,21 @@ jobs:
         # Private state must not use an Actions cache or artifact in a public
         # repository. A dedicated, narrowly scoped KV namespace is optional;
         # without it the CLI never sends and no durable state is claimed.
-        if: vars.CERTIWATCH_STATE_KV_NAMESPACE != ''
+        if: vars.CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE != ''
         env:
-          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_STATE_KV_TOKEN }}
-          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_STATE_KV_NAMESPACE }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_PRODUCTION_STATE_KV_TOKEN }}
+          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
         run: python3 scripts/alert_state_store.py pull --out .certiwatch/alert_state.json
 
       - name: Build public history and private alert state
         id: monitor
         env:
-          CERTIWATCH_DISCORD_WEBHOOK: ${{ secrets.CERTIWATCH_DISCORD_WEBHOOK }}
-          CERTIWATCH_ALERTS_ENABLED: ${{ vars.CERTIWATCH_ALERTS_ENABLED }}
-          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_STATE_KV_TOKEN }}
-          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_STATE_KV_NAMESPACE }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CERTIWATCH_DISCORD_WEBHOOK: ${{ secrets.CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK }}
+          CERTIWATCH_ALERTS_ENABLED: ${{ vars.CERTIWATCH_PRODUCTION_ALERTS_ENABLED }}
+          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_PRODUCTION_STATE_KV_TOKEN }}
+          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           transport=none
@@ -169,11 +218,11 @@ jobs:
           fi
           if [ "${CERTIWATCH_ALERTS_ENABLED:-false}" = "true" ]; then
             if [ -z "${CERTIWATCH_DISCORD_WEBHOOK:-}" ]; then
-              echo "::error::CERTIWATCH_ALERTS_ENABLED is true but CERTIWATCH_DISCORD_WEBHOOK is not set."
+              echo "::error::Production alerts are enabled but CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK is not set."
               exit 1
             fi
             if [ "$checkpoint" != "kv" ]; then
-              echo "::error::Discord alerts require CERTIWATCH_STATE_KV_NAMESPACE for a remote checkpoint."
+              echo "::error::Production Discord alerts require CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE for a remote checkpoint."
               exit 1
             fi
             transport=discord
@@ -200,7 +249,7 @@ jobs:
         # cache outage is a warning, not a publish blocker.
         if: always() && hashFiles('history.json') != ''
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: history.json
           key: certiwatch-history-${{ github.run_id }}-${{ github.run_attempt }}
@@ -212,11 +261,11 @@ jobs:
         run: python3 scripts/build_dist.py --out dist
 
       - name: Deploy to Cloudflare Pages
+        # The branch and project are validated allowlist values exported above,
+        # never raw ref or variable text.
         uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd  # v3.15.0
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Project name must match the published hostname (certiwatch.pages.dev).
-          # Override with the CLOUDFLARE_PAGES_PROJECT repository variable if the
-          # Cloudflare account still holds this project under another name.
-          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT || 'certiwatch' }} --branch=main
+          apiToken: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_API_TOKEN }}
+          accountId: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
+          # Production deploys use the main branch of the Pages project.
+          command: pages deploy dist --project-name=${{ env.CERTIWATCH_PAGES_PROJECT }} --branch=main

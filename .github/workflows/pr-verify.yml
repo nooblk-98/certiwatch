@@ -1,9 +1,9 @@
 name: CertiWatch PR verification
 
-# Dedicated PR-only workflow. It exists separately from the production
-# workflow so offline checks can still run when that workflow is disabled for
-# repository inactivity. It has no secrets, no deploy step, no history cache
-# and no private state.
+# Dedicated PR-only workflow. It exists separately from the publish workflow so
+# offline checks can still run when that workflow is disabled for repository
+# inactivity. It has no secrets, no deploy step, no history cache and no
+# private state, and it never deploys a preview.
 on:
   pull_request:
 

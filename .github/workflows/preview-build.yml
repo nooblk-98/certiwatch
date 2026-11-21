@@ -1,0 +1,124 @@
+name: CertiWatch preview build
+
+# Secret-free, deploy-free build of a preview bundle for a development branch.
+#
+# This workflow runs the pushed branch's own code, so it deliberately holds no
+# credentials and no environment: nothing it can reach is worth stealing. It
+# uploads the finished static bundle as a short-lived Actions artifact.
+#
+# preview-publish.yml, which runs from the default branch on completion of this
+# workflow, validates that artifact and only then attaches the Cloudflare
+# credentials. Keeping the untrusted build and the credentialed publish in
+# separate workflows is what makes same-account previews safe to operate: a pull
+# request or a branch push can produce files, but can never reach the token,
+# the production environment, or the production Pages project.
+on:
+  push:
+    branches:
+      - dev
+      - develop
+      - development
+      - "development/*"
+      - "development/*/*"
+    # The same path filter as production: only changes that alter the checks,
+    # configuration, dashboard or published bundle are worth rebuilding. Two
+    # levels under development/ is the supported maximum; see ssl-check.yml.
+    paths:
+      - "requirements.txt"
+      - "certiwatch.toml"
+      - "schema/**"
+      - "index.html"
+      - "app.js"
+      - "style.css"
+      - "ssl.conf"
+      - "domains.conf"
+      - "pages/**"
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/preview-build.yml"
+      - ".github/workflows/verify.yml"
+
+# Reads the repository and uploads one artifact. It never writes to the
+# repository, never touches an environment and never deploys.
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes an unfinished preview build.
+concurrency:
+  group: certiwatch-preview-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Offline checks
+    # Reusable and secret-free; the PR workflow runs the same contract.
+    uses: ./.github/workflows/verify.yml
+
+  build:
+    name: Build preview bundle (${{ github.ref_name }})
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Validate unified configuration
+        run: python3 src/validate_conf.py --config certiwatch.toml --no-dns
+
+      - name: Run SSL checker
+        # Same public checks as production. No history is restored, no private
+        # alert state is read, and no alert transport is configured.
+        run: python3 src/ssl/scripts/check_ssl.py --config certiwatch.toml
+
+      - name: Run domain expiry checker
+        run: python3 src/domain/scripts/check_domains.py --config certiwatch.toml
+
+      - name: Build Pages bundle
+        # No history.json is present in a fresh checkout and none is restored,
+        # so a preview bundle contains the current results, feeds and badges
+        # but never the production history.
+        run: python3 scripts/build_dist.py --out dist
+
+      - name: Bound the bundle before upload
+        # A first-line cost guard, not a security boundary: the publisher
+        # enforces the authoritative limits. It stops an accidental or careless
+        # branch from filling artifact storage or timing out the publisher.
+        run: |
+          set -euo pipefail
+          files=$(find dist -type f | wc -l)
+          bytes=$(du -sb dist | cut -f1)
+          if [ "$files" -gt 1500 ]; then
+            echo "::error::Preview bundle has $files files; the publisher accepts at most 1500."
+            exit 1
+          fi
+          if [ "$bytes" -gt 26214400 ]; then
+            echo "::error::Preview bundle is $bytes bytes; the publisher accepts at most 25 MiB."
+            exit 1
+          fi
+          echo "Preview bundle: $files files, $bytes bytes before compression."
+
+      - name: Upload preview bundle
+        # A fixed artifact name is the only handle the publisher uses, together
+        # with this run's id from the workflow_run event. Retention is short:
+        # the artifact exists to hand one build to one publish, not as storage.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: certiwatch-preview-bundle
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+          include-hidden-files: false

@@ -138,30 +138,442 @@ starttls_protocol = "smtp"
 
 ## Deploy with GitHub Actions
 
-The [`CertiWatch checks`](.github/workflows/ssl-check.yml) workflow runs daily at 00:30 UTC, on relevant pushes to `main`, and on demand. Offline tests must pass before anything is published. Pull requests run the same tests without secrets and never deploy.
+Previews use the same Cloudflare account as production, in a separate Pages
+project. Delivery is split so that branch code never runs with Cloudflare
+credentials:
 
-1. Fork this repository and edit `certiwatch.toml`.
-2. Add the settings below under **Settings > Secrets and variables > Actions**.
-3. Open the **Actions** tab, select **CertiWatch checks**, and choose **Run workflow**.
+- `ssl-check.yml` checks and publishes production from `main`.
+- `preview-build.yml` builds a preview bundle on a development branch with no
+  secrets, no environment and no deploy step, then uploads it as a short-lived
+  Actions artifact.
+- `preview-publish.yml` runs from the default branch when that build finishes,
+  validates the artifact, and only then deploys it with the preview
+  environment's credentials.
+- `verify.yml` (reusable, secret-free) and `pr-verify.yml` (PR-only) run the
+  offline checks.
 
-| Name | Type | Required | Description |
-| --- | --- | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | Secret | Yes | Token with Cloudflare Pages edit permission |
-| `CLOUDFLARE_ACCOUNT_ID` | Secret | Yes | Cloudflare account ID |
-| `CLOUDFLARE_PAGES_PROJECT` | Variable | No | Pages project name, defaults to `certiwatch` |
-| `CERTIWATCH_ALERTS_ENABLED` | Variable | For alerts | Set to `true` to allow Discord delivery |
-| `CERTIWATCH_DISCORD_WEBHOOK` | Secret | For alerts | Discord webhook URL |
-| `CERTIWATCH_STATE_KV_NAMESPACE` | Variable | For alerts | Dedicated KV namespace for private alert state |
-| `CERTIWATCH_STATE_KV_TOKEN` | Secret | For alerts | Separate token limited to Workers KV Storage edit |
+Nothing is deployed by hand.
 
-> [!IMPORTANT]
-> GitHub disables scheduled workflows after 60 days of repository inactivity, and the dashboard then keeps showing its last published data. To resume monitoring, re-enable **CertiWatch checks** in the **Actions** tab and run it once.
+### Triggers
 
-### Enable Discord alerts
+| Trigger | What runs |
+|---|---|
+| `pull_request` | `pr-verify.yml` calls the reusable offline checks. A pull request never publishes, needs no secrets, and makes no external probes. |
+| `push` to `main` | `ssl-check.yml` runs the same offline checks, then the certificate checks and a production publish. Only for files that affect the checks, the dashboard or the published bundle. |
+| `push` to `dev`, `develop`, `development`, `development/*` or `development/*/*` | `preview-build.yml` runs the offline checks, the certificate checks and a secret-free bundle build. When it succeeds, `preview-publish.yml` validates that run's artifact and publishes it. No other branch, tag or pull request deploys. |
+| `schedule` | Every day at **06:00 Asia/Colombo (UTC+5:30)**, i.e. **00:30 UTC**. |
+| `workflow_dispatch` | Manual run from the GitHub Actions tab. Publishes production from `main` only; it never deploys a preview. |
 
-Alerts must be enabled in two places: set `discord = true` under `[alerts]` in `certiwatch.toml`, and set `CERTIWATCH_ALERTS_ENABLED` to `true`. CI also requires the KV namespace, because alert state must survive between runs.
+Superseded preview builds and publishes on a development branch are cancelled.
+A run on `main` is never cancelled mid-publish: a second one waits behind it
+(`concurrency: certiwatch-${{ github.ref }}`).
 
-The first run records a baseline and sends nothing. After that, CertiWatch alerts on status changes, threshold crossings, and certificate fingerprint changes. Failed deliveries are retried on the next run, so a duplicate alert is possible but a lost one is not.
+### Automated checks
+
+The `verify` job runs offline on every trigger and must pass before anything can
+be published:
+
+| Check | Command |
+|---|---|
+| Unified config contract (offline) | `python3 src/validate_conf.py --config certiwatch.toml --no-dns` |
+| Python unit tests (in-memory certificates, local TLS servers/fakes only) | `python -m pytest -q -p no:cacheprovider` |
+| Dashboard tests | `node --test tests/dashboard.test.mjs` |
+| Publish-bundle and feed tests | `python3 scripts/test_build_dist.py` |
+
+Run the same four commands before opening a pull request. None needs network
+access, credentials, previous history or private state, so a pull request can be
+verified on a fork. Pull requests do not run either checker, do not restore the
+history cache, do not touch the KV namespace and cannot deploy.
+
+The checks live in the reusable, no-secret `verify.yml`. A dedicated
+`pr-verify.yml` calls it on every pull request, and both the production and
+preview jobs call it as their `needs: verify` dependency. The split means PR
+verification can run even when the publish workflow has been disabled for
+repository inactivity; the PR workflow has no secrets and no publish path.
+
+The production job runs only for `github.ref == 'refs/heads/main'`, so a `main`
+run - push, schedule or manual - cannot deploy unless every check passes first.
+The preview job runs only for a `push` to one of the named development branches;
+a manual dispatch is skipped rather than publishing.
+
+### What a publishing run does
+
+1. Fails when a required input is missing, empty or a symlink (`certiwatch.toml`,
+   `schema/certiwatch.schema.json`, `index.html`, `pages/_headers`,
+   `scripts/build_dist.py`, `scripts/build_public_feeds.py`,
+   `scripts/alert_state_store.py`, `src/config.py`, `src/monitor_state.py`).
+2. Validates `certiwatch.toml` against the schema (the legacy `.conf` files are
+   not consulted while TOML exists).
+3. Restores public `history.json` from the Actions cache on `main` only.
+4. Runs the SSL and domain checkers with `--config certiwatch.toml`.
+5. Optionally pulls the private alert state from the dedicated KV namespace.
+6. Runs `src/monitor_state.py`: writes the public history snapshot, writes the
+   pending batch to the remote KV checkpoint, and only then delivers opt-in
+   events. A checkpoint failure means zero sends.
+7. Saves public history back to the Actions cache even after a delivery
+   warning. `monitor_state.py` owns all private checkpoint writes; there is no
+   redundant post-run KV put.
+8. Stages the atomic publish directory with `scripts/build_dist.py`, including
+   the feeds and history.
+9. Deploys `dist/` to Cloudflare Pages, from `main` only.
+
+It does **not** commit the results back to `main`; see
+[Generated data and Git](#generated-data-and-git).
+
+### What a preview run does
+
+A preview is a real deploy of the checked development branch, published to a
+**distinct Pages project in the same Cloudflare account as production**. It is
+split into two workflows so that branch code never holds the token:
+
+1. `preview-build.yml` runs on the development branch with `contents: read`,
+   no environment and no secrets. It validates `certiwatch.toml`, runs both
+   checkers, builds `dist/` with `scripts/build_dist.py`, and uploads
+   `certiwatch-preview-bundle` for three days. A fresh checkout has no
+   `history.json` and none is restored, and `monitor_state.py` is never run, so
+   the bundle has no history and no alert state.
+2. `preview-publish.yml` is started by `workflow_run` when that build finishes.
+   The job starts only for a **successful `push`** of
+   `.github/workflows/preview-build.yml`, from **this repository** (not a fork,
+   not a pull request), on one of the supported branches below. Everything the
+   credentialed job runs - the workflow, the validation and the deploy command
+   - comes from the protected default branch.
+3. It never lets an action unpack the artifact. For the exact run id it asks
+   the Actions API for the single `certiwatch-preview-bundle` record, requires
+   it to be unexpired, and checks its compressed size against a 32 MiB cap. It
+   then downloads the ZIP with a hard byte cap and confirms the bytes received
+   match the metadata, refusing an artifact that changed between the two.
+4. It inspects the ZIP **central directory** before writing anything: only the
+   reviewed static allowlist may appear; absolute paths, `..`, backslashes,
+   directory entries, symlinks and other non-regular members, duplicate or
+   case-colliding names, encrypted members, empty members, more than 1,500
+   members, more than 8 MiB per member, more than 25 MiB declared in aggregate,
+   and unsafe compression ratios are all rejected. Only approved members are
+   then streamed into a fresh `preview-bundle/` directory, counting the bytes
+   the decompressor actually produces, so a lying header cannot exceed the
+   limits. Pages Functions, `_worker.js`, `_redirects`, `history.json` and
+   unlisted badges are never written at all.
+5. A second pass validates the extracted tree: every badge must match the
+   SHA-256 in `badges/manifest.json`, the result JSON must be a real monitoring
+   result, and the HTML and calendar must have the expected shape.
+6. There is **no checkout** in the publisher, of either the source branch or
+   the default branch, so no repository script can run while the Cloudflare
+   token is present. All of this is inline Python in the same job, before the
+   credential step; the only action that runs with the token is the pinned
+   Wrangler action.
+7. It fails closed unless the `certiwatch-preview` environment provides
+   `CERTIWATCH_PREVIEW_PAGES_API_TOKEN` and
+   `CERTIWATCH_PREVIEW_PAGES_ACCOUNT_ID`, the account id equals the trusted
+   `CERTIWATCH_PRODUCTION_ACCOUNT_ID`, and `CERTIWATCH_PREVIEW_PROJECT` is set
+   and differs from the production project.
+8. It deploys `preview-bundle/` to that project on a `preview-` alias.
+
+The production project, its deployment history, its custom domains and the
+production `history.json`, KV checkpoint and Discord transport are never
+touched. The publisher has no access to any `CERTIWATCH_PRODUCTION_*` secret;
+it sees only the environment-scoped preview values.
+
+A preview alias is derived from the branch with an allowlist: lowercased, `/`
+and other separators become `-`, only `a-z`, `0-9`, `.`, `_` and `-` survive,
+the slug is capped at 40 characters, and a determined eight-character SHA-256
+prefix of the **full ref** is appended after a mandatory `preview-` prefix. The
+hash prevents collisions such as `development/api/v2` and
+`development/api-v2` mapping to the same alias. For example
+`development/team-feature` deploys as
+`preview-development-team-feature-218ee579`, while
+`development/team/feature` deploys as
+`preview-development-team-feature-bb8acb47`. A flat `development/api` push
+deploys as `preview-development-api-671f86aa`, reachable at
+`https://preview-development-api-671f86aa.<preview-project>.pages.dev`. The
+alias can never be `main`, and the deploy command only receives allowlisted
+values, so a branch name or repository variable cannot add arguments.
+
+Preview branches are supported to **two levels under `development/`**
+(`development/*` and `development/*/*`). Deeper branches do not trigger the
+build workflow; the publisher re-checks the branch name and its own trigger
+filter lists the same patterns, so a disallowed ref cannot publish even if the
+filter changes.
+
+**Preview results are public.** Cloudflare Pages preview deployments are
+reachable on the public internet by default, and the bundle contains the same
+public certificate and domain results as production. A preview has no history
+and no alerts, but it must still be treated as a public publishing surface. If
+a preview must be private, put Cloudflare Access in front of it; do not rely on
+an unguessable hostname.
+
+The same path filter as production applies: a preview deploys when a push to a
+development branch changes the checks, configuration, dashboard or bundle
+inputs. A docs-only push does not redeploy.
+
+### Same-account security notes
+
+A Cloudflare API token with Pages edit is **account-scoped**: it can act on any
+Pages project in that account, and project-scoped Pages tokens are not assumed
+or claimed here. Putting previews in the production account therefore removes
+the account boundary that the previous design used. The remaining controls are:
+
+- The publish job's environment (`certiwatch-preview`) must allow **`main`
+  only**. The publisher runs from the default branch, so a development ref can
+  never read those secrets, even if the workflow file is edited.
+- No checkout and no repository script in the publisher; the branch supplies
+  only a static artifact that is validated against the allowlist above.
+- No extraction action touches the artifact. The publisher inspects the ZIP
+  central directory and streams only approved members under real byte limits,
+  so a malformed, oversized, duplicate-entry or traversal ZIP is refused before
+  it can write a file.
+- A distinct, required Pages project with no production custom domain, plus a
+  mandatory `preview-` alias, so a preview cannot replace the production
+  deployment or its custom domain.
+- A separate preview environment secret, so the preview token can be revoked
+  independently. You may paste the same token value as production into it;
+  a dedicated token is preferred but not required.
+- A pinned Wrangler CLI version for preview deploys, so a new 3.x release
+  cannot change the credentialed job without review.
+
+The residual risk is the account-scoped token: anyone who can read the preview
+environment secret can also act on the production Pages project through the
+Cloudflare API. Treat write access to `dev`, `develop`, `development/*` and
+`development/*/*` as permission to publish preview results, and keep the
+environment's required reviewers on if that risk is not acceptable.
+
+### Removed workflow
+
+`release.yml` (Auto Release Notes) was removed. It ran an unrelated third-party
+action on `release: created` with `contents: write`, and used a hosted model to
+rewrite release notes. Release-note wording belongs to the Technical Writer and
+release state to the Issue & Release Coordinator, neither of which needs a
+write-scoped token in this repository. Removing it also drops an unnecessary
+third-party Actions dependency. GitHub may continue to list `Auto Release Notes`
+in the Actions tab until the deletion lands on the default branch; it cannot run
+once the file is gone.
+
+### Publish safety rules
+
+`scripts/build_dist.py` refuses to build rather than publish something wrong:
+
+- **Missing, empty or malformed input**, including a result file with no rows.
+- **Unreadable TLS run**: when *every* SSL row ended in DNS, connection,
+  handshake or input failure (`dns_error`, `timeout`, `no_https`, `ssl_error`,
+  `error`), no certificate was read. That is a runner without egress or a
+  network outage, so production is left untouched. Any run containing at least
+  one real verdict (`valid`, `expired`, `invalid`) publishes normally, so
+  expiring and invalid certificates are still reported.
+- **Symlinked inputs**: a symlinked file, or a symlinked parent directory such as
+  `pages`, is refused, so nothing outside the checkout can enter the bundle.
+- **Malformed public history**: a present `history.json` must be an object with
+  a non-empty `snapshots` list, valid unique `YYYY-MM-DD` dates and both row
+  lists. Invalid history fails the build instead of publishing a corrupt chart.
+- **Unsafe destinations**: output outside the checkout is allowed; inside it only
+  `dist` is. A non-empty destination is replaced only if every entry is a file
+  this builder produces and `_headers` is present; otherwise it is refused and
+  left intact.
+- **Strict generated allowlist**: feed output is limited to `status.json`,
+  `expiries.ics`, `badges/manifest.json` and badge names matching
+  `<slug>-<sha256:32>.svg`. A foreign nested file or directory under `badges/`
+  refuses the rebuild. A repeat build accepts the previous bundle, including a
+  stale badge it will replace.
+
+The build assembles a hidden sibling directory, generates the feeds into it,
+and swaps it into place at the end. A failed feed, history or copy step never
+leaves a half-filled `dist/` behind for a deploy step to publish.
+
+### Published bundle
+
+Only the files below are uploaded:
+
+| Path in `dist/` | Source | Required |
+|---|---|---|
+| `index.html` | `index.html` | yes |
+| `ssl_results.json` | generated by `check_ssl.py` | yes |
+| `domain_results.json` | generated by `check_domains.py` | yes |
+| `_headers` | `pages/_headers` | yes |
+| `status.json` | generated by `build_public_feeds.py` | yes |
+| `expiries.ics` | generated by `build_public_feeds.py` | yes |
+| `badges/manifest.json` | generated by `build_public_feeds.py` | yes |
+| `badges/<slug>-<sha256>.svg` | generated by `build_public_feeds.py` | yes, one per domain |
+| `history.json` | generated by `monitor_state.py` | no, copied when present |
+| `app.js` | `app.js` | no, copied when present |
+| `style.css` | `style.css` | no, copied when present |
+
+`scripts/build_dist.py` owns this list. Sources, images, workflows, private
+state and configuration never reach the public site. Badge names are dynamic,
+so the builder accepts only the manifest plus the exact hash-suffixed SVG
+pattern; adding any other runtime file means an explicit reviewed change.
+
+`pages/_headers` sets `no-cache, must-revalidate` on the four JSON endpoints so
+a new deployment is visible immediately. The calendar and badges may be reused
+for five minutes (`max-age=300`) and then revalidate. It also sets
+`application/json`, `text/calendar` and `image/svg+xml` content types. Confirm
+the served headers once after the first deploy; Pages controls some MIME types
+itself.
+
+### Required GitHub configuration
+
+Nothing below is applied by this repository. An administrator must configure it
+before enabling previews or merging this change.
+
+#### Repository variables
+
+These are non-secret, trusted settings under
+**Settings → Secrets and variables → Actions → Variables**:
+
+| Name | Required | Description |
+|---|---|---|
+| `CERTIWATCH_PRODUCTION_ACCOUNT_ID` | yes | The shared Cloudflare account ID. The preview account secret must equal it, so a preview pointing at another account fails closed. |
+| `CERTIWATCH_PRODUCTION_PAGES_PROJECT` | no | Production Pages project; defaults to `certiwatch`. |
+| `CERTIWATCH_PREVIEW_PROJECT` | yes | The distinct preview Pages project in the same account. There is no default, and it must differ from the production project. It may be set here or as an environment variable in `certiwatch-preview`. |
+
+#### `certiwatch-production` environment
+
+Create the environment under **Settings → Environments**. Under
+**Deployment branches and tags**, choose **Selected branches and tags** and
+allow **`main` only**. This binds the production credentials to production, so
+a job on any other ref cannot read them even if the workflow file changes.
+
+| Name | Kind | Description |
+|---|---|---|
+| `CERTIWATCH_PRODUCTION_PAGES_API_TOKEN` | environment secret | Pages edit token for the production account |
+| `CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID` | environment secret | Production account ID; must equal `CERTIWATCH_PRODUCTION_ACCOUNT_ID` |
+| `CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK` | environment secret, optional | Discord webhook URL, read by `monitor_state.py` only |
+| `CERTIWATCH_PRODUCTION_STATE_KV_TOKEN` | environment secret, optional | KV-edit token used only for the alert-state namespace; do not reuse the Pages token |
+| `CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE` | environment variable, optional | KV namespace id for private alert state |
+| `CERTIWATCH_PRODUCTION_ALERTS_ENABLED` | environment variable, optional | Set to `true` to allow production Discord delivery; default off |
+
+Create the KV namespace and its token manually in Cloudflare; this repository
+never creates or rotates credentials. A token limited to **Workers KV
+Storage:Edit** for the production account is enough. The workflow writes the key
+`certiwatch-alert-state`; it does not list or read any other key. If the KV
+variables are absent, the workflow skips both KV steps and runs with
+`--transport none`.
+
+#### `certiwatch-preview` environment
+
+Previews run in the **same Cloudflare account** as production, in a separate
+Pages project. Create the preview project in that account, give it a name that
+differs from the production project, and do not attach a production custom
+domain to it.
+
+Create the environment under **Settings → Environments** and add these to that
+environment only:
+
+| Name | Kind | Description |
+|---|---|---|
+| `CERTIWATCH_PREVIEW_PAGES_API_TOKEN` | environment secret | Pages edit token for the shared account. You may reuse the production token's value here; a dedicated token is preferred so it can be revoked independently. |
+| `CERTIWATCH_PREVIEW_PAGES_ACCOUNT_ID` | environment secret | The shared account ID; rejected unless it equals `CERTIWATCH_PRODUCTION_ACCOUNT_ID` |
+| `CERTIWATCH_PREVIEW_PROJECT` | environment variable, **required** | Distinct preview Pages project in the same account; no default |
+
+Under **Deployment branches and tags**, choose **Selected branches and tags**
+and allow **`main` only**. `preview-publish.yml` is a `workflow_run` workflow, so
+it runs on the default branch's ref even though it publishes content from a
+development branch. Allowing only `main` is what keeps the preview token out of
+any job started by another ref. Required reviewers are optional but
+recommended, especially now that the token is account-scoped.
+
+The preview publisher fails when either secret or the project variable is
+missing, when the account id differs from the trusted production account id, or
+when the project equals the production project. It never reads a
+`CERTIWATCH_PRODUCTION_*` secret. Keep the two `CERTIWATCH_PREVIEW_PAGES_*`
+secrets at environment level only: a repository-level secret with the same
+name would be a fallback outside the `main`-only policy.
+
+#### Migration from the two-account design
+
+The previous revision required a **separate Cloudflare account** for previews
+and read `CLOUDFLARE_PREVIEW_API_TOKEN` and `CLOUDFLARE_PREVIEW_ACCOUNT_ID`
+from the `certiwatch-preview` environment. It also allowed the development
+branches on that environment and deployed the preview directly from the push
+job. All of that is replaced by the split build/publish pair above.
+
+Migrate in this order:
+
+1. In the shared Cloudflare account, create the preview Pages project (for
+   example `certiwatch-preview`). Do not add a production custom domain to it.
+2. In GitHub, set the `CERTIWATCH_PREVIEW_PROJECT` variable to that name. It
+   must differ from `CERTIWATCH_PRODUCTION_PAGES_PROJECT`.
+3. In the `certiwatch-preview` environment, add
+   `CERTIWATCH_PREVIEW_PAGES_ACCOUNT_ID` with the shared account ID and
+   `CERTIWATCH_PREVIEW_PAGES_API_TOKEN` with a Pages edit token for that
+   account. Pasting the existing production token value is supported; a
+   dedicated token is preferable.
+4. Change the `certiwatch-preview` environment's deployment branch policy from
+   the development patterns to **`main` only**.
+5. Delete the old `CLOUDFLARE_PREVIEW_API_TOKEN` and
+   `CLOUDFLARE_PREVIEW_ACCOUNT_ID` environment secrets. They point at the old
+   separate account and are no longer read.
+6. Merge this change to `main`, so both preview workflow files exist on the
+   default branch. `workflow_run` only fires for a workflow that exists there.
+7. Push to a development branch and confirm the build uploads
+   `certiwatch-preview-bundle` and the publisher deploys it.
+
+The old separate Cloudflare account and its Pages project are not used by this
+repository after the migration. Deleting them is an account-owner action, not
+something a workflow or this patch does.
+
+#### Removal of old repository-level secrets
+
+The earlier revision also read repository-level `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, `CERTIWATCH_STATE_KV_TOKEN`,
+`CERTIWATCH_DISCORD_WEBHOOK`, and the variables `CLOUDFLARE_PAGES_PROJECT`,
+`CERTIWATCH_STATE_KV_NAMESPACE` and `CERTIWATCH_ALERTS_ENABLED`. No workflow in
+this change references those names.
+
+**Delete all of those old repository-level secrets and variables after adding
+the environment-scoped replacements and before enabling previews.** Leaving
+them in place provides no benefit and keeps credentials usable by any workflow
+that names them. Verify the Actions secrets/variables list is empty of the old
+names, then enable the preview environment.
+
+#### Activation gates
+
+Do these in order; none is performed by this repository:
+
+1. Create the `certiwatch-production` environment, bind it to `main`, and add
+   its secrets and variables.
+2. Create the preview Pages project in the same Cloudflare account; create the
+   `certiwatch-preview` environment with its two secrets, the required project
+   variable, and the **`main`-only** branch policy.
+3. Add the repository variables, including `CERTIWATCH_PREVIEW_PROJECT`.
+4. Delete the old preview secrets and every old repository-level secret and
+   variable listed above.
+5. Protect `main`: require a pull request, require the PR verification check,
+   and block direct pushes and force-pushes.
+6. Restrict write access to `dev`, `develop`, `development/*` and
+   `development/*/*`. A push to one of those branches builds the preview
+   artifact, and write access there is equivalent to permission to publish a
+   preview result.
+7. Only then merge this change, so the default branch contains the publisher,
+   and let the first preview run.
+
+Rotate a Pages credential by issuing a new Cloudflare API token with Pages edit
+permission in the account, updating the matching environment secret, and
+revoking the old token. Both environments use the same account, so rotate the
+production and preview tokens independently if they are separate tokens.
+Credentials belong only in the GitHub secret store: never commit them, paste
+them into an issue or workflow log, or pass them through a variable. A token
+disclosed anywhere else should be revoked and replaced rather than reused. No
+DNS challenge credential is used or needed: deployment goes through the
+Cloudflare Pages API and the workflow never edits DNS records.
+
+All actions are pinned to full commit SHAs: `actions/checkout` v4,
+`actions/setup-python` v5, `actions/setup-node` v4, `actions/cache` v4,
+`actions/upload-artifact` v4.6.2 and the verified
+`cloudflare/wrangler-action` release `v3.15.0` commit (`9acf94a…`).
+Preview deploys additionally pin Wrangler itself to `3.114.17`. A retagged or
+compromised tag therefore cannot change what runs with an API token.
+`checkout` runs with `persist-credentials: false`; no step pushes to Git, and
+the preview publisher does not check out at all.
+
+### Rollback
+
+Cloudflare Pages keeps every deployment. To revert a bad publish, open
+**Workers & Pages → certiwatch → Deployments**, pick the last known-good
+deployment and choose **Rollback**. The site then serves that deployment's
+bundle, including its result files, until the next successful run. No Git revert
+is needed for a rollback; revert the offending commit separately if it also
+changed the dashboard, configuration or checks.
+
+The build step prints a manifest of every published file with its size and
+SHA-256 prefix, so the log of a run identifies exactly what was deployed.
 
 ## Public feeds
 
