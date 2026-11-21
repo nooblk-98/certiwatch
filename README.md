@@ -138,10 +138,21 @@ starttls_protocol = "smtp"
 
 ## Deploy with GitHub Actions
 
-`.github/workflows/ssl-check.yml` is the single workflow that runs the checks
-and deploys to Cloudflare Pages, for both production and previews. Nothing is
-deployed by hand. The only other workflows are the reusable, secret-free
-`verify.yml` and the PR-only `pr-verify.yml`.
+Previews use the same Cloudflare account as production, in a separate Pages
+project. Delivery is split so that branch code never runs with Cloudflare
+credentials:
+
+- `ssl-check.yml` checks and publishes production from `main`.
+- `preview-build.yml` builds a preview bundle on a development branch with no
+  secrets, no environment and no deploy step, then uploads it as a short-lived
+  Actions artifact.
+- `preview-publish.yml` runs from the default branch when that build finishes,
+  validates the artifact, and only then deploys it with the preview
+  environment's credentials.
+- `verify.yml` (reusable, secret-free) and `pr-verify.yml` (PR-only) run the
+  offline checks.
+
+Nothing is deployed by hand.
 
 ### Triggers
 
@@ -149,12 +160,12 @@ deployed by hand. The only other workflows are the reusable, secret-free
 |---|---|
 | `pull_request` | `pr-verify.yml` calls the reusable offline checks. A pull request never publishes, needs no secrets, and makes no external probes. |
 | `push` to `main` | `ssl-check.yml` runs the same offline checks, then the certificate checks and a production publish. Only for files that affect the checks, the dashboard or the published bundle. |
-| `push` to `dev`, `develop`, `development`, `development/*` or `development/*/*` | The same offline checks, then the certificate checks and a preview publish. No other branch, tag or pull request deploys. |
+| `push` to `dev`, `develop`, `development`, `development/*` or `development/*/*` | `preview-build.yml` runs the offline checks, the certificate checks and a secret-free bundle build. When it succeeds, `preview-publish.yml` validates that run's artifact and publishes it. No other branch, tag or pull request deploys. |
 | `schedule` | Every day at **06:00 Asia/Colombo (UTC+5:30)**, i.e. **00:30 UTC**. |
 | `workflow_dispatch` | Manual run from the GitHub Actions tab. Publishes production from `main` only; it never deploys a preview. |
 
-Superseded preview runs on a development branch are cancelled. A run on `main`
-is never cancelled mid-publish: a second one waits behind it
+Superseded preview builds and publishes on a development branch are cancelled.
+A run on `main` is never cancelled mid-publish: a second one waits behind it
 (`concurrency: certiwatch-${{ github.ref }}`).
 
 ### Automated checks
@@ -211,42 +222,77 @@ It does **not** commit the results back to `main`; see
 
 ### What a preview run does
 
-A preview is a real deploy of the checked development branch, kept in a
-separate Cloudflare account and a distinct Pages project:
+A preview is a real deploy of the checked development branch, published to a
+**distinct Pages project in the same Cloudflare account as production**. It is
+split into two workflows so that branch code never holds the token:
 
-1. Fails closed unless the `certiwatch-preview` environment provides both
-   preview secrets and the required `CERTIWATCH_PREVIEW_PROJECT` variable. It
-   never falls back to the production token, project, or repository secrets.
-2. Refuses to continue when the preview account equals the trusted production
-   account, or the preview project equals the production project.
-3. Validates `certiwatch.toml` and runs the SSL and domain checkers.
-4. Builds `dist/` with `scripts/build_dist.py`. No history is restored and
-   `monitor_state.py` is never run, so the bundle has no alert state.
-5. Deploys `dist/` to the separate preview project on a preview branch.
+1. `preview-build.yml` runs on the development branch with `contents: read`,
+   no environment and no secrets. It validates `certiwatch.toml`, runs both
+   checkers, builds `dist/` with `scripts/build_dist.py`, and uploads
+   `certiwatch-preview-bundle` for three days. A fresh checkout has no
+   `history.json` and none is restored, and `monitor_state.py` is never run, so
+   the bundle has no history and no alert state.
+2. `preview-publish.yml` is started by `workflow_run` when that build finishes.
+   The job starts only for a **successful `push`** of
+   `.github/workflows/preview-build.yml`, from **this repository** (not a fork,
+   not a pull request), on one of the supported branches below. Everything the
+   credentialed job runs - the workflow, the validation and the deploy command
+   - comes from the protected default branch.
+3. It never lets an action unpack the artifact. For the exact run id it asks
+   the Actions API for the single `certiwatch-preview-bundle` record, requires
+   it to be unexpired, and checks its compressed size against a 32 MiB cap. It
+   then downloads the ZIP with a hard byte cap and confirms the bytes received
+   match the metadata, refusing an artifact that changed between the two.
+4. It inspects the ZIP **central directory** before writing anything: only the
+   reviewed static allowlist may appear; absolute paths, `..`, backslashes,
+   directory entries, symlinks and other non-regular members, duplicate or
+   case-colliding names, encrypted members, empty members, more than 1,500
+   members, more than 8 MiB per member, more than 25 MiB declared in aggregate,
+   and unsafe compression ratios are all rejected. Only approved members are
+   then streamed into a fresh `preview-bundle/` directory, counting the bytes
+   the decompressor actually produces, so a lying header cannot exceed the
+   limits. Pages Functions, `_worker.js`, `_redirects`, `history.json` and
+   unlisted badges are never written at all.
+5. A second pass validates the extracted tree: every badge must match the
+   SHA-256 in `badges/manifest.json`, the result JSON must be a real monitoring
+   result, and the HTML and calendar must have the expected shape.
+6. There is **no checkout** in the publisher, of either the source branch or
+   the default branch, so no repository script can run while the Cloudflare
+   token is present. All of this is inline Python in the same job, before the
+   credential step; the only action that runs with the token is the pinned
+   Wrangler action.
+7. It fails closed unless the `certiwatch-preview` environment provides
+   `CERTIWATCH_PREVIEW_PAGES_API_TOKEN` and
+   `CERTIWATCH_PREVIEW_PAGES_ACCOUNT_ID`, the account id equals the trusted
+   `CERTIWATCH_PRODUCTION_ACCOUNT_ID`, and `CERTIWATCH_PREVIEW_PROJECT` is set
+   and differs from the production project.
+8. It deploys `preview-bundle/` to that project on a `preview-` alias.
 
-The production account and project are untouched. The preview job never reads
-or writes the production `history.json`, the KV alert checkpoint, or the Discord
-transport. It has no access to any `CERTIWATCH_PRODUCTION_*` secret; it only
-sees the environment-scoped `CLOUDFLARE_PREVIEW_*` values.
+The production project, its deployment history, its custom domains and the
+production `history.json`, KV checkpoint and Discord transport are never
+touched. The publisher has no access to any `CERTIWATCH_PRODUCTION_*` secret;
+it sees only the environment-scoped preview values.
 
-A preview branch alias is derived from the ref with an allowlist: lowercased,
-`/` and other separators become `-`, only `a-z`, `0-9`, `.`, `_` and `-` survive,
-the slug is capped at 48 characters, and a deterministic eight-character
-SHA-256 prefix of the **full ref** is appended. The hash prevents collisions
-such as `development/api/v2` and `development/api-v2` mapping to the same
-alias. For example `development/team-feature` deploys as
-`development-team-feature-218ee579`, while `development/team/feature` deploys
-as `development-team-feature-bb8acb47`. A flat `development/api` push deploys
-as `development-api-671f86aa`, reachable at
-`https://development-api-671f86aa.<preview-project>.pages.dev`.
+A preview alias is derived from the branch with an allowlist: lowercased, `/`
+and other separators become `-`, only `a-z`, `0-9`, `.`, `_` and `-` survive,
+the slug is capped at 40 characters, and a determined eight-character SHA-256
+prefix of the **full ref** is appended after a mandatory `preview-` prefix. The
+hash prevents collisions such as `development/api/v2` and
+`development/api-v2` mapping to the same alias. For example
+`development/team-feature` deploys as
+`preview-development-team-feature-218ee579`, while
+`development/team/feature` deploys as
+`preview-development-team-feature-bb8acb47`. A flat `development/api` push
+deploys as `preview-development-api-671f86aa`, reachable at
+`https://preview-development-api-671f86aa.<preview-project>.pages.dev`. The
+alias can never be `main`, and the deploy command only receives allowlisted
+values, so a branch name or repository variable cannot add arguments.
 
 Preview branches are supported to **two levels under `development/`**
 (`development/*` and `development/*/*`). Deeper branches do not trigger the
-workflow, because a GitHub environment branch policy matches one path segment
-per `*` and does not let `**` cross `/`; an unbounded `development/**` trigger
-could not be matched by the environment policy. The alias and project are
-validated before they are interpolated into the deploy command, so a branch
-name or repository variable cannot add command arguments.
+build workflow; the publisher re-checks the branch name and its own trigger
+filter lists the same patterns, so a disallowed ref cannot publish even if the
+filter changes.
 
 **Preview results are public.** Cloudflare Pages preview deployments are
 reachable on the public internet by default, and the bundle contains the same
@@ -258,6 +304,37 @@ an unguessable hostname.
 The same path filter as production applies: a preview deploys when a push to a
 development branch changes the checks, configuration, dashboard or bundle
 inputs. A docs-only push does not redeploy.
+
+### Same-account security notes
+
+A Cloudflare API token with Pages edit is **account-scoped**: it can act on any
+Pages project in that account, and project-scoped Pages tokens are not assumed
+or claimed here. Putting previews in the production account therefore removes
+the account boundary that the previous design used. The remaining controls are:
+
+- The publish job's environment (`certiwatch-preview`) must allow **`main`
+  only**. The publisher runs from the default branch, so a development ref can
+  never read those secrets, even if the workflow file is edited.
+- No checkout and no repository script in the publisher; the branch supplies
+  only a static artifact that is validated against the allowlist above.
+- No extraction action touches the artifact. The publisher inspects the ZIP
+  central directory and streams only approved members under real byte limits,
+  so a malformed, oversized, duplicate-entry or traversal ZIP is refused before
+  it can write a file.
+- A distinct, required Pages project with no production custom domain, plus a
+  mandatory `preview-` alias, so a preview cannot replace the production
+  deployment or its custom domain.
+- A separate preview environment secret, so the preview token can be revoked
+  independently. You may paste the same token value as production into it;
+  a dedicated token is preferred but not required.
+- A pinned Wrangler CLI version for preview deploys, so a new 3.x release
+  cannot change the credentialed job without review.
+
+The residual risk is the account-scoped token: anyone who can read the preview
+environment secret can also act on the production Pages project through the
+Cloudflare API. Treat write access to `dev`, `develop`, `development/*` and
+`development/*/*` as permission to publish preview results, and keep the
+environment's required reviewers on if that risk is not acceptable.
 
 ### Removed workflow
 
@@ -342,8 +419,9 @@ These are non-secret, trusted settings under
 
 | Name | Required | Description |
 |---|---|---|
-| `CERTIWATCH_PRODUCTION_ACCOUNT_ID` | yes | Production Cloudflare account ID. Used only for consistency and separation checks; it does not replace account isolation. |
+| `CERTIWATCH_PRODUCTION_ACCOUNT_ID` | yes | The shared Cloudflare account ID. The preview account secret must equal it, so a preview pointing at another account fails closed. |
 | `CERTIWATCH_PRODUCTION_PAGES_PROJECT` | no | Production Pages project; defaults to `certiwatch`. |
+| `CERTIWATCH_PREVIEW_PROJECT` | yes | The distinct preview Pages project in the same account. There is no default, and it must differ from the production project. It may be set here or as an environment variable in `certiwatch-preview`. |
 
 #### `certiwatch-production` environment
 
@@ -370,41 +448,70 @@ variables are absent, the workflow skips both KV steps and runs with
 
 #### `certiwatch-preview` environment
 
-A Cloudflare API token with Pages edit is **account-scoped**: it can act on any
-Pages project in that account. Project-scoped Pages tokens are not assumed or
-claimed here. The only real isolation boundary is a **separate Cloudflare
-account**, so create one for previews, plus a Pages project in that account
-whose name differs from production.
+Previews run in the **same Cloudflare account** as production, in a separate
+Pages project. Create the preview project in that account, give it a name that
+differs from the production project, and do not attach a production custom
+domain to it.
 
 Create the environment under **Settings → Environments** and add these to that
 environment only:
 
 | Name | Kind | Description |
 |---|---|---|
-| `CLOUDFLARE_PREVIEW_API_TOKEN` | environment secret | Pages edit token for the separate preview account |
-| `CLOUDFLARE_PREVIEW_ACCOUNT_ID` | environment secret | Preview account ID; rejected if it equals the production account |
-| `CERTIWATCH_PREVIEW_PROJECT` | environment variable, **required** | Distinct preview Pages project; there is no default |
+| `CERTIWATCH_PREVIEW_PAGES_API_TOKEN` | environment secret | Pages edit token for the shared account. You may reuse the production token's value here; a dedicated token is preferred so it can be revoked independently. |
+| `CERTIWATCH_PREVIEW_PAGES_ACCOUNT_ID` | environment secret | The shared account ID; rejected unless it equals `CERTIWATCH_PRODUCTION_ACCOUNT_ID` |
+| `CERTIWATCH_PREVIEW_PROJECT` | environment variable, **required** | Distinct preview Pages project in the same account; no default |
 
 Under **Deployment branches and tags**, choose **Selected branches and tags**
-and allow exactly `dev`, `develop`, `development`, `development/*` and
-`development/*/*`. These are the same patterns as the workflow trigger.
+and allow **`main` only**. `preview-publish.yml` is a `workflow_run` workflow, so
+it runs on the default branch's ref even though it publishes content from a
+development branch. Allowing only `main` is what keeps the preview token out of
+any job started by another ref. Required reviewers are optional but
+recommended, especially now that the token is account-scoped.
 
-The two match because GitHub environment rules use Ruby `File.fnmatch`
-semantics: one `*` matches exactly one path segment and never crosses `/`, and
-`**` does not cross `/` either. A single `development/**` rule would therefore
-cover only one level, and a policy with only `development/*` would also fail a
-nested `development/team/feature` push. Listing both depths keeps the policy
-identical to the supported trigger; a deeper branch is outside the supported
-set and does not trigger a job. Required reviewers are optional but
-recommended.
+The preview publisher fails when either secret or the project variable is
+missing, when the account id differs from the trusted production account id, or
+when the project equals the production project. It never reads a
+`CERTIWATCH_PRODUCTION_*` secret. Keep the two `CERTIWATCH_PREVIEW_PAGES_*`
+secrets at environment level only: a repository-level secret with the same
+name would be a fallback outside the `main`-only policy.
 
-The preview job fails when either secret or the project variable is missing, and
-it refuses a preview that resolves to the production account or project. It
-never reads repository-level production secrets.
+#### Migration from the two-account design
 
-#### Migration and removal of old repository secrets
+The previous revision required a **separate Cloudflare account** for previews
+and read `CLOUDFLARE_PREVIEW_API_TOKEN` and `CLOUDFLARE_PREVIEW_ACCOUNT_ID`
+from the `certiwatch-preview` environment. It also allowed the development
+branches on that environment and deployed the preview directly from the push
+job. All of that is replaced by the split build/publish pair above.
 
-The previous revision read repository-level `CLOUDFLARE_API_TOKEN`,
+Migrate in this order:
+
+1. In the shared Cloudflare account, create the preview Pages project (for
+   example `certiwatch-preview`). Do not add a production custom domain to it.
+2. In GitHub, set the `CERTIWATCH_PREVIEW_PROJECT` variable to that name. It
+   must differ from `CERTIWATCH_PRODUCTION_PAGES_PROJECT`.
+3. In the `certiwatch-preview` environment, add
+   `CERTIWATCH_PREVIEW_PAGES_ACCOUNT_ID` with the shared account ID and
+   `CERTIWATCH_PREVIEW_PAGES_API_TOKEN` with a Pages edit token for that
+   account. Pasting the existing production token value is supported; a
+   dedicated token is preferable.
+4. Change the `certiwatch-preview` environment's deployment branch policy from
+   the development patterns to **`main` only**.
+5. Delete the old `CLOUDFLARE_PREVIEW_API_TOKEN` and
+   `CLOUDFLARE_PREVIEW_ACCOUNT_ID` environment secrets. They point at the old
+   separate account and are no longer read.
+6. Merge this change to `main`, so both preview workflow files exist on the
+   default branch. `workflow_run` only fires for a workflow that exists there.
+7. Push to a development branch and confirm the build uploads
+   `certiwatch-preview-bundle` and the publisher deploys it.
+
+The old separate Cloudflare account and its Pages project are not used by this
+repository after the migration. Deleting them is an account-owner action, not
+something a workflow or this patch does.
+
+#### Removal of old repository-level secrets
+
+The earlier revision also read repository-level `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, `CERTIWATCH_STATE_KV_TOKEN`,
 `CERTIWATCH_DISCORD_WEBHOOK`, and the variables `CLOUDFLARE_PAGES_PROJECT`,
 `CERTIWATCH_STATE_KV_NAMESPACE` and `CERTIWATCH_ALERTS_ENABLED`. No workflow in
@@ -422,33 +529,39 @@ Do these in order; none is performed by this repository:
 
 1. Create the `certiwatch-production` environment, bind it to `main`, and add
    its secrets and variables.
-2. Create the separate Cloudflare account and preview project; create the
-   `certiwatch-preview` environment with its secrets, required project
-   variable, and the branch policy above.
-3. Add the two repository variables.
-4. Delete every old repository-level secret and variable listed above.
+2. Create the preview Pages project in the same Cloudflare account; create the
+   `certiwatch-preview` environment with its two secrets, the required project
+   variable, and the **`main`-only** branch policy.
+3. Add the repository variables, including `CERTIWATCH_PREVIEW_PROJECT`.
+4. Delete the old preview secrets and every old repository-level secret and
+   variable listed above.
 5. Protect `main`: require a pull request, require the PR verification check,
    and block direct pushes and force-pushes.
 6. Restrict write access to `dev`, `develop`, `development/*` and
-   `development/*/*`. A push to one of those branches runs that branch's code
-   with the preview token, so write access there is equivalent to permission to
-   use the preview credentials.
-7. Only then merge this change and let the first preview run.
+   `development/*/*`. A push to one of those branches builds the preview
+   artifact, and write access there is equivalent to permission to publish a
+   preview result.
+7. Only then merge this change, so the default branch contains the publisher,
+   and let the first preview run.
 
 Rotate a Pages credential by issuing a new Cloudflare API token with Pages edit
-permission in the relevant account, updating the matching environment secret,
-and revoking the old token. Credentials belong only in the GitHub secret store:
-never commit them, paste them into an issue or workflow log, or pass them
-through a variable. A token disclosed anywhere else should be revoked and
-replaced rather than reused. No DNS challenge credential is used or needed:
-deployment goes through the Cloudflare Pages API and the workflow never edits
-DNS records.
+permission in the account, updating the matching environment secret, and
+revoking the old token. Both environments use the same account, so rotate the
+production and preview tokens independently if they are separate tokens.
+Credentials belong only in the GitHub secret store: never commit them, paste
+them into an issue or workflow log, or pass them through a variable. A token
+disclosed anywhere else should be revoked and replaced rather than reused. No
+DNS challenge credential is used or needed: deployment goes through the
+Cloudflare Pages API and the workflow never edits DNS records.
 
 All actions are pinned to full commit SHAs: `actions/checkout` v4,
-`actions/setup-python` v5, `actions/setup-node` v4, `actions/cache` v4, and the
-verified `cloudflare/wrangler-action` release `v3.15.0` commit (`9acf94a…`).
-A retagged or compromised tag therefore cannot change what runs with an API
-token. `checkout` runs with `persist-credentials: false`; no step pushes to Git.
+`actions/setup-python` v5, `actions/setup-node` v4, `actions/cache` v4,
+`actions/upload-artifact` v4.6.2 and the verified
+`cloudflare/wrangler-action` release `v3.15.0` commit (`9acf94a…`).
+Preview deploys additionally pin Wrangler itself to `3.114.17`. A retagged or
+compromised tag therefore cannot change what runs with an API token.
+`checkout` runs with `persist-credentials: false`; no step pushes to Git, and
+the preview publisher does not check out at all.
 
 ### Rollback
 
