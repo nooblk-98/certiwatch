@@ -205,17 +205,6 @@ jobs:
           path: history.json
           key: certiwatch-history-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Push private alert state to KV
-        # Always runs after monitor_state: a crash after a successful send
-        # must leave the pending batch durable, so the next run retries it
-        # (delivery is at-least-once). Never upload this path as an artifact.
-        if: always() && vars.CERTIWATCH_STATE_KV_NAMESPACE != '' && hashFiles('.certiwatch/alert_state.json') != ''
-        env:
-          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_STATE_KV_TOKEN }}
-          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_STATE_KV_NAMESPACE }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: python3 scripts/alert_state_store.py push --in .certiwatch/alert_state.json
-
       - name: Build Pages bundle
         # Feeds and history join the bundle inside this atomic staging step.
         # It fails on missing/empty/malformed inputs, symlinks, an all-

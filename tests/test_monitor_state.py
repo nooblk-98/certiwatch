@@ -854,3 +854,224 @@ def test_cli_does_not_send_when_local_state_write_fails(tmp_path, monkeypatch):
     assert code == 1
     assert transport.payloads == []
     assert checkpoint.saved == []
+
+
+# ── Bounded batches, partial failure and TLS coverage ───────────────────────
+
+
+def make_event(index: int, domain: str | None = None) -> dict:
+    name = domain or f"example-{index:03d}.example"
+    return {
+        "id": f"event-{index}",
+        "key": f"ssl:{name}",
+        "kind": "ssl",
+        "domain": name,
+        "type": "status",
+        "from": "valid",
+        "to": "expired",
+        "days_left": index,
+        "date": "2026-11-21",
+    }
+
+
+def test_discord_batches_are_bounded_and_never_drop_events():
+    events = [make_event(index) for index in range(80)]
+    batches = ms.build_discord_batches(events)
+
+    assert len(batches) > 1
+    assert sum(len(batch.events) for batch in batches) == len(events)
+    assert all(len(batch.payload["content"]) <= ms.MAX_DISCORD_CONTENT for batch in batches)
+    sent_ids = [event["id"] for batch in batches for event in batch.events]
+    assert sent_ids == [event["id"] for event in events]
+    assert all("…and" not in batch.payload["content"] for batch in batches)
+
+
+def test_a_single_oversized_event_is_refused_not_truncated():
+    with pytest.raises(ms.MonitoringError, match="exceeds|too large"):
+        ms.build_discord_batches([make_event(0, domain="x" * 3000 + ".example")])
+
+
+def test_partial_multi_batch_failure_keeps_only_unacknowledged_events(
+    tmp_path, monkeypatch
+):
+    _write_cli_inputs(tmp_path)
+    assert ms.main(_cli_args(tmp_path, transport="none")) == 0
+
+    events = [make_event(index) for index in range(80)]
+    state_path = tmp_path / "private" / "alert_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-11-20T00:00:00Z",
+                "observations": {},
+                "pending_events": events,
+            }
+        ),
+        encoding="utf-8",
+    )
+    first_batch = len(ms.build_discord_batches(events)[0].events)
+
+    order: list = []
+    checkpoint = RecordingCheckpoint(order)
+
+    class FailSecondBatch:
+        def __init__(self):
+            self.calls = 0
+
+        def send(self, payload):
+            self.calls += 1
+            order.append(("send", self.calls))
+            if self.calls == 2:
+                return ms.TransportResponse(500)
+            return ms.TransportResponse(204)
+
+        @classmethod
+        def from_env(cls, timeout=15.0):
+            return cls()
+
+    transport = FailSecondBatch()
+
+    class FakeWebhook:
+        @classmethod
+        def from_env(cls, timeout=15.0):
+            return transport
+
+    monkeypatch.setattr(ms, "DiscordWebhookTransport", FakeWebhook)
+    monkeypatch.setattr(ms, "checkpoint_from_args", lambda args: checkpoint)
+    code = ms.main(
+        [
+            *_cli_args(tmp_path, transport="discord", checkpoint="kv"),
+            "--max-attempts",
+            "1",
+        ]
+    )
+
+    assert code == 2
+    assert transport.calls == 2, "must not continue after an unacknowledged batch"
+    assert [len(state["pending_events"]) for state in checkpoint.saved] == [
+        len(events),
+        len(events) - first_batch,
+    ]
+    final = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(final["pending_events"]) == len(events) - first_batch
+    assert final["pending_events"][0]["id"] == events[first_batch]["id"]
+
+
+def test_all_unreachable_tls_run_never_writes_history_state_or_alerts(
+    tmp_path, monkeypatch, capsys
+):
+    _write_cli_inputs(tmp_path)
+    assert ms.main(_cli_args(tmp_path, transport="none")) == 0
+
+    history_path = tmp_path / "history.json"
+    state_path = tmp_path / "private" / "alert_state.json"
+    history_before = history_path.read_bytes()
+    state_before = state_path.read_bytes()
+
+    failed = ssl_output(
+        ssl_row("one.example", status="dns_error", days=None),
+        ssl_row("two.example", status="timeout", days=None),
+    )
+    (tmp_path / "ssl_results.json").write_text(json.dumps(failed), encoding="utf-8")
+
+    order: list = []
+    checkpoint = RecordingCheckpoint(order)
+    transport = RecordingTransport(order)
+
+    class FakeWebhook:
+        @classmethod
+        def from_env(cls, timeout=15.0):
+            return transport
+
+    monkeypatch.setattr(ms, "DiscordWebhookTransport", FakeWebhook)
+    monkeypatch.setattr(ms, "checkpoint_from_args", lambda args: checkpoint)
+    code = ms.main(_cli_args(tmp_path, transport="none", checkpoint="kv"))
+
+    assert code == 1
+    assert history_path.read_bytes() == history_before
+    assert state_path.read_bytes() == state_before
+    assert checkpoint.saved == []
+    assert transport.payloads == []
+    assert "no certificate was read" in capsys.readouterr().err
+
+
+def test_put_404_checkpoint_means_zero_sends(tmp_path, monkeypatch):
+    import sys
+    import urllib.error
+
+    scripts = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import alert_state_store
+
+    _write_cli_inputs(tmp_path)
+    assert ms.main(_cli_args(tmp_path, transport="none")) == 0
+    _write_cli_inputs(tmp_path, expired=True)
+
+    order: list = []
+    transport = RecordingTransport(order)
+
+    class FakeWebhook:
+        @classmethod
+        def from_env(cls, timeout=15.0):
+            return transport
+
+    def not_found(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+
+    monkeypatch.setenv("CERTIWATCH_STATE_KV_TOKEN", "token")
+    monkeypatch.setenv("CERTIWATCH_STATE_KV_NAMESPACE", "namespace")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    monkeypatch.setattr(ms, "DiscordWebhookTransport", FakeWebhook)
+    monkeypatch.setattr(alert_state_store.urllib.request, "urlopen", not_found)
+    code = ms.main(_cli_args(tmp_path, transport="discord", checkpoint="kv"))
+
+    assert code == 1
+    assert transport.payloads == []
+    state = json.loads((tmp_path / "private" / "alert_state.json").read_text(encoding="utf-8"))
+    assert state["pending_events"], "pending batch must survive a PUT 404"
+
+
+def test_each_acknowledged_batch_advances_the_checkpoint(tmp_path, monkeypatch):
+    _write_cli_inputs(tmp_path)
+    assert ms.main(_cli_args(tmp_path, transport="none")) == 0
+
+    events = [make_event(index) for index in range(80)]
+    state_path = tmp_path / "private" / "alert_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-11-20T00:00:00Z",
+                "observations": {},
+                "pending_events": events,
+            }
+        ),
+        encoding="utf-8",
+    )
+    batch_sizes = [len(batch.events) for batch in ms.build_discord_batches(events)]
+    assert len(batch_sizes) >= 3
+
+    order: list = []
+    checkpoint = RecordingCheckpoint(order)
+    transport = RecordingTransport(order)
+
+    class FakeWebhook:
+        @classmethod
+        def from_env(cls, timeout=15.0):
+            return transport
+
+    monkeypatch.setattr(ms, "DiscordWebhookTransport", FakeWebhook)
+    monkeypatch.setattr(ms, "checkpoint_from_args", lambda args: checkpoint)
+    code = ms.main(_cli_args(tmp_path, transport="discord", checkpoint="kv"))
+
+    assert code == 0
+    assert len(transport.payloads) == len(batch_sizes)
+    expected = [len(events)]
+    remaining = len(events)
+    for size in batch_sizes:
+        remaining -= size
+        expected.append(remaining)
+    assert [len(state["pending_events"]) for state in checkpoint.saved] == expected
+    assert checkpoint.saved[-1]["pending_events"] == []

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import http.server
 import ssl
+import threading
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 
 import check_ssl as cs
 import config as cfg
-from conftest import build_cert, dns_san
+from conftest import build_cert, cert_pem, dns_san, ip_san, key_pem
 
 
 # ── Weak key classification ──────────────────────────────────────────────────
@@ -69,6 +71,8 @@ def test_classify_hsts_parses_directives():
     assert result == {
         "present": True,
         "valid": True,
+        "enabled": True,
+        "status": "present",
         "max_age": 31536000,
         "include_subdomains": True,
         "preload": True,
@@ -77,20 +81,34 @@ def test_classify_hsts_parses_directives():
 
 
 @pytest.mark.parametrize(
-    "header, present, valid",
+    "header, present, valid, enabled, status",
     [
-        (None, False, False),
-        ("max-age=0", True, True),
-        ("max-age=abc", True, False),
-        ("includeSubDomains", True, False),
-        ("max-age=-1", True, False),
+        (None, False, False, False, "absent"),
+        ("max-age=0", True, True, False, "disabled"),
+        ("max-age=abc", True, False, False, "invalid"),
+        ("includeSubDomains", True, False, False, "invalid"),
+        ("max-age=-1", True, False, False, "invalid"),
     ],
 )
-def test_classify_hsts_absent_and_invalid(header, present, valid):
+def test_classify_hsts_absent_disabled_and_invalid(
+    header, present, valid, enabled, status
+):
     headers = {} if header is None else {"Strict-Transport-Security": header}
     result = cs.classify_hsts(headers)
     assert result["present"] is present
     assert result["valid"] is valid
+    assert result["enabled"] is enabled
+    assert result["status"] == status
+
+
+def test_hsts_max_age_zero_is_disabled_not_an_error():
+    result = cs.classify_hsts({"Strict-Transport-Security": "max-age=0"})
+
+    assert result["present"] is True
+    assert result["valid"] is True
+    assert result["enabled"] is False
+    assert result["status"] == "disabled"
+    assert result["error"] is None
 
 
 def test_hsts_is_not_checked_for_non_https():
@@ -108,16 +126,162 @@ def test_hsts_is_not_checked_for_non_https():
     assert calls == []
 
 
-def test_hsts_fetch_failure_is_reported_without_raising():
+def test_hsts_fetch_failure_is_indeterminate_not_absent():
     def broken(host, port):
-        raise OSError("connection refused")
+        raise ssl.SSLCertVerificationError("hostname mismatch")
 
     result = cs.check_hsts("example.com", 443, applicable=True, fetcher=broken)
 
     assert result["applicable"] is True
     assert result["checked"] is True
-    assert result["present"] is False
-    assert "connection refused" in result["error"]
+    assert result["status"] == "indeterminate"
+    assert result["present"] is None
+    assert result["valid"] is None
+    assert result["enabled"] is None
+    assert "hostname mismatch" in result["error"]
+
+
+def test_hsts_connection_uses_verified_context_and_configured_trust_store(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeContext:
+        check_hostname = False
+        verify_mode = ssl.CERT_NONE
+
+    class FakeResponse:
+        def getheaders(self):
+            return [("Strict-Transport-Security", "max-age=60")]
+
+        def read(self):
+            return b""
+
+    class FakeConnection:
+        def __init__(self, host, port, *, timeout, context):
+            captured.update(
+                {
+                    "host": host,
+                    "port": port,
+                    "timeout": timeout,
+                    "context": context,
+                }
+            )
+
+        def request(self, *args, **kwargs):
+            return None
+
+        def getresponse(self):
+            return FakeResponse()
+
+        def close(self):
+            return None
+
+    context = FakeContext()
+    monkeypatch.setattr(cs, "CA_FILE", "/tmp/certiwatch-ca.pem")
+    monkeypatch.setattr(
+        cs.ssl,
+        "create_default_context",
+        lambda cafile=None: captured.update({"cafile": cafile}) or context,
+    )
+    monkeypatch.setattr(cs.http.client, "HTTPSConnection", FakeConnection)
+
+    headers = cs.fetch_https_headers("example.com", 443)
+
+    assert headers == {"strict-transport-security": "max-age=60"}
+    assert captured["cafile"] == "/tmp/certiwatch-ca.pem"
+    assert captured["host"] == "example.com"
+    assert captured["port"] == 443
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+class _HstsHandler(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Strict-Transport-Security", "max-age=60")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_args):
+        return None
+
+
+def _start_https_hsts_server(cert, key, tmp_path):
+    cert_file = tmp_path / "hsts-server-cert.pem"
+    key_file = tmp_path / "hsts-server-key.pem"
+    cert_file.write_bytes(cert_pem(cert))
+    key_file.write_bytes(key_pem(key))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert_file), str(key_file))
+    server = http.server.HTTPServer(("127.0.0.1", 0), _HstsHandler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def test_hsts_authenticates_trust_and_san_offline(tmp_path, ca_bundle, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root = build_cert(
+        common_name="CertiWatch Test Root",
+        key=root_key,
+        is_ca=True,
+        organization="CertiWatch Test CA",
+    )
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf = build_cert(
+        common_name="127.0.0.1",
+        key=leaf_key,
+        sans=ip_san("127.0.0.1"),
+        issuer_cert=root,
+        issuer_key=root_key,
+    )
+    monkeypatch.setattr(cs, "CA_FILE", ca_bundle(root))
+    server, thread = _start_https_hsts_server(leaf, leaf_key, tmp_path)
+    try:
+        headers = cs.fetch_https_headers("127.0.0.1", server.server_port)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert headers["strict-transport-security"] == "max-age=60"
+
+
+def test_hsts_hostname_mismatch_is_indeterminate(tmp_path, ca_bundle, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root = build_cert(
+        common_name="CertiWatch Test Root",
+        key=root_key,
+        is_ca=True,
+        organization="CertiWatch Test CA",
+    )
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf = build_cert(
+        common_name="127.0.0.2",
+        key=leaf_key,
+        sans=ip_san("127.0.0.2"),
+        issuer_cert=root,
+        issuer_key=root_key,
+    )
+    monkeypatch.setattr(cs, "CA_FILE", ca_bundle(root))
+    server, thread = _start_https_hsts_server(leaf, leaf_key, tmp_path)
+    try:
+        result = cs.check_hsts(
+            "127.0.0.1",
+            server.server_port,
+            applicable=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result["status"] == "indeterminate"
+    assert result["present"] is None
 
 
 def test_check_ssl_hsts_and_dns_only_use_configured_options(monkeypatch):
@@ -158,6 +322,8 @@ def test_check_ssl_hsts_and_dns_only_use_configured_options(monkeypatch):
             "checked": True,
             "present": True,
             "valid": True,
+            "enabled": True,
+            "status": "present",
             "max_age": 60,
             "include_subdomains": False,
             "preload": False,
@@ -235,6 +401,128 @@ def test_starttls_missing_capability_is_a_remote_tls_error():
 def test_unknown_starttls_protocol_is_local_unsupported():
     with pytest.raises(cs.StartTLSUnsupported, match="unsupported"):
         cs._starttls_exchange(FakeSocket(b""), "ftp")
+
+
+def test_starttls_aggregate_read_byte_cap():
+    sock = FakeSocket(b"220 " + b"x" * 100 + b"\r\n")
+
+    with pytest.raises(cs.StartTLSError, match="byte cap"):
+        cs._starttls_exchange(sock, "smtp", max_bytes=20)
+
+
+def test_starttls_aggregate_line_cap():
+    sock = FakeSocket(b"220 hi\r\n250-one\r\n250-two\r\n")
+
+    with pytest.raises(cs.StartTLSError, match="line cap"):
+        cs._starttls_exchange(sock, "smtp", max_lines=1)
+
+
+def test_starttls_write_bytes_count_toward_the_cap():
+    sock = FakeSocket(b"220 hi\r\n")
+
+    with pytest.raises(cs.StartTLSError, match="byte cap"):
+        cs._starttls_exchange(sock, "smtp", max_bytes=10)
+
+    assert sock.sent == [], "the over-budget command must not be written"
+
+
+def test_starttls_line_length_cap():
+    sock = FakeSocket(b"220 " + b"x" * 50 + b"\r\n")
+
+    with pytest.raises(cs.StartTLSError, match="line length cap"):
+        cs._starttls_exchange(sock, "smtp", max_line_bytes=20)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class ClockedSocket(FakeSocket):
+    def __init__(self, data: bytes, clock: FakeClock, step: float) -> None:
+        super().__init__(data)
+        self._clock = clock
+        self._step = step
+
+    def recv(self, size: int) -> bytes:
+        self._clock.now += self._step
+        return super().recv(size)
+
+    def sendall(self, data: bytes) -> None:
+        self._clock.now += self._step
+        super().sendall(data)
+
+
+def test_starttls_deadline_covers_the_whole_plaintext_exchange():
+    clock = FakeClock()
+    sock = ClockedSocket(b"220 hi\r\n", clock, step=1.0)
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        cs._starttls_exchange(sock, "smtp", timeout=2.0, clock=clock)
+
+
+def test_starttls_write_time_counts_toward_the_deadline():
+    class WriteClockedSocket(FakeSocket):
+        def sendall(self, data: bytes) -> None:
+            clock.now += 2.0
+            super().sendall(data)
+
+    clock = FakeClock()
+    sock = WriteClockedSocket(b"220 hi\r\n")
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        cs._starttls_exchange(sock, "smtp", timeout=1.0, clock=clock)
+
+
+def test_starttls_budget_error_keeps_protocol_classification(monkeypatch):
+    target = cfg.Target(
+        host="mail.example.com",
+        port=587,
+        tls_mode="starttls",
+        starttls_protocol="smtp",
+        check_dns=False,
+        check_hsts=False,
+    )
+    monkeypatch.setattr(
+        cs,
+        "probe_starttls",
+        lambda host, port, protocol: (_ for _ in ()).throw(
+            cs.StartTLSError("STARTTLS aggregate byte cap exceeded")
+        ),
+    )
+
+    result = cs.check_ssl("mail.example.com:587", target=target)
+
+    assert result["status"] == "ssl_error"
+    assert result["tls_mode"] == "starttls"
+    assert "byte cap" in result["error"]
+
+
+def test_starttls_deadline_keeps_timeout_classification(monkeypatch):
+    target = cfg.Target(
+        host="mail.example.com",
+        port=587,
+        tls_mode="starttls",
+        starttls_protocol="smtp",
+        check_dns=False,
+        check_hsts=False,
+    )
+    monkeypatch.setattr(
+        cs,
+        "probe_starttls",
+        lambda host, port, protocol: (_ for _ in ()).throw(
+            TimeoutError("STARTTLS negotiation deadline exceeded")
+        ),
+    )
+
+    result = cs.check_ssl("mail.example.com:587", target=target)
+
+    assert result["status"] == "timeout"
+    assert result["tls_mode"] == "starttls"
+    assert "timed out" in result["error"].lower()
 
 
 def test_check_ssl_target_options_keep_direct_tls_verdict(tls_server, rsa_key):

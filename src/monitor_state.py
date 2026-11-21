@@ -47,10 +47,15 @@ Usage
 Use ``--transport discord`` only after the Discord opt-in and secret are
 configured, and always with ``--checkpoint kv`` (or ``local`` on a genuinely
 persistent host): the pending event batch is written to the remote checkpoint
-before the send. A checkpoint failure aborts with zero sends; the cleared state
-is written only after an acknowledged delivery. A crash can therefore duplicate
-an alert but never lose one. Pull-request and offline test runs use
+before the first send. Events are split into bounded messages; after each
+acknowledged batch the local and remote states retain only the unacknowledged
+events. A checkpoint failure aborts with zero sends; the cleared state is
+written only after an acknowledged delivery. A crash can therefore duplicate an
+alert but never lose one. Pull-request and offline test runs use
 ``--transport none``; they make no network calls.
+
+The existing publish TLS-coverage gate runs before any history, private state or
+alert write. An all-unreachable run exits without advancing either file.
 
 Exit codes: 0 written successfully (including disabled delivery with pending
 events preserved); 1 configuration/input error or checkpoint failure; 2 history
@@ -99,6 +104,14 @@ class MonitoringError(ValueError):
 
 class DeliveryError(RuntimeError):
     """Discord delivery failed after its retry budget."""
+
+
+class BatchDeliveryError(DeliveryError):
+    """A later batch failed after earlier batches were acknowledged."""
+
+    def __init__(self, message: str, delivered: int) -> None:
+        super().__init__(message)
+        self.delivered = delivered
 
 
 class TransportError(RuntimeError):
@@ -963,37 +976,148 @@ def _escape_mentions(text: str) -> str:
     return text.replace("@", "@\u200b")
 
 
-def build_discord_payload(
-    events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Build a mention-safe Discord message for a batch of events."""
-    header = "**CertiWatch alert**"
-    lines = [_event_line(event) for event in events]
-    if not lines:
-        lines = ["- no changes"]
+DISCORD_HEADER = "**CertiWatch alert**"
 
-    content = header + "\n" + "\n".join(lines)
+
+@dataclass(frozen=True)
+class DiscordBatch:
+    """One Discord message and the exact events it carries."""
+
+    events: tuple[dict[str, Any], ...]
+    payload: dict[str, Any]
+
+
+def _payload_for_lines(lines: list[str]) -> dict[str, Any]:
+    content = DISCORD_HEADER + "\n" + "\n".join(lines)
     if len(content) > MAX_DISCORD_CONTENT:
-        kept: list[str] = []
-        used = len(header) + 1
-        omitted = 0
-        for line in lines:
-            if used + len(line) + 1 > MAX_DISCORD_CONTENT - 40:
-                omitted += 1
-                continue
-            kept.append(line)
-            used += len(line) + 1
-        content = header + "\n" + "\n".join(kept)
-        if omitted:
-            content += f"\n- …and {omitted} more"
-    content = _escape_mentions(content)
+        raise MonitoringError(
+            f"one Discord alert line is too large for {MAX_DISCORD_CONTENT} "
+            "characters; refusing to truncate silently"
+        )
     return {
-        "content": content[:MAX_DISCORD_CONTENT],
+        "content": content,
         "allowed_mentions": {"parse": []},
     }
 
 
+def build_discord_payload(
+    events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build one mention-safe payload; refuse rather than truncate."""
+    lines = [_escape_mentions(_event_line(event)) for event in events]
+    return _payload_for_lines(lines or ["- no changes"])
+
+
+def build_discord_batches(
+    events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> tuple[DiscordBatch, ...]:
+    """Partition events into bounded messages without dropping any event.
+
+    Discord limits a message's content to 2000 characters. Each batch is sent
+    and acknowledged separately so the checkpoint can retain only the events
+    that have not been delivered. A single event line that cannot fit fails the
+    run before any send; it is never shortened.
+    """
+    sources = list(events)
+    if not sources:
+        return (DiscordBatch((), build_discord_payload([])),)
+
+    header_length = len(DISCORD_HEADER) + 1
+    batches: list[DiscordBatch] = []
+    batch_events: list[dict[str, Any]] = []
+    batch_lines: list[str] = []
+    used = header_length
+
+    for event in sources:
+        line = _escape_mentions(_event_line(event))
+        addition = len(line) + 1
+        if header_length + addition > MAX_DISCORD_CONTENT:
+            raise MonitoringError(
+                "one alert line exceeds the Discord message limit; "
+                "refusing to truncate it"
+            )
+        if batch_lines and used + addition > MAX_DISCORD_CONTENT:
+            batches.append(
+                DiscordBatch(tuple(batch_events), _payload_for_lines(batch_lines))
+            )
+            batch_events = []
+            batch_lines = []
+            used = header_length
+        batch_events.append(event)
+        batch_lines.append(line)
+        used += addition
+
+    if batch_lines:
+        batches.append(DiscordBatch(tuple(batch_events), _payload_for_lines(batch_lines)))
+    return tuple(batches)
+
+
+def deliver_batches(
+    plan: MonitoringPlan,
+    batches: tuple[DiscordBatch, ...],
+    *,
+    transport: Transport,
+    checkpoint: Checkpoint | None,
+    alert_state_path: str | Path,
+    max_attempts: int,
+    retry_delay: float,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Send batches in order; checkpoint remaining events after each ack.
+
+    The caller has already checkpointed the complete pending batch. After every
+    acknowledged message the local and remote states are rewritten with only
+    the events that are still unacknowledged. If a send or checkpoint fails,
+    the exception propagates and the remaining events stay durable.
+    """
+    remaining = list(plan.events)
+    delivered = 0
+    for batch in batches:
+        try:
+            post_with_retry(
+                transport,
+                batch.payload,
+                max_attempts=max_attempts,
+                base_delay=retry_delay,
+                sleep=sleep,
+            )
+        except DeliveryError as exc:
+            raise BatchDeliveryError(str(exc), delivered) from exc
+        delivered += len(batch.events)
+        remaining = remaining[len(batch.events) :]
+        state = finalize_alert_state(
+            plan.alert_state,
+            remaining,
+            delivered=False,
+        )
+        write_json_atomic(alert_state_path, state)
+        if checkpoint is not None:
+            checkpoint.save(state)
+    return delivered
+
+
 # ── Files and CLI ────────────────────────────────────────────────────────────
+
+
+def enforce_tls_coverage(ssl_output: dict[str, Any]) -> None:
+    """Apply the publish gate before history, state or alert side effects.
+
+    The gate is owned by ``scripts/build_dist.py`` so the publish builder and
+    this CLI cannot disagree about what "all rows failed before a certificate
+    was read" means.
+    """
+    if str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        from build_dist import BuildError, validate_ssl_coverage
+    except ImportError as exc:  # pragma: no cover - deployment mistake
+        raise MonitoringError(f"TLS coverage gate is unavailable: {exc}") from exc
+    try:
+        validate_ssl_coverage(ssl_output.get("results"))
+    except BuildError as exc:
+        raise MonitoringError(
+            f"refusing to write history or alerts: {exc}"
+        ) from exc
 
 
 def load_result_file(path: str | Path, label: str) -> dict[str, Any]:
@@ -1107,6 +1231,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         ssl_output = load_result_file(args.ssl_results, "ssl_results.json")
+        # No history, private state or alert may advance for a run where every
+        # TLS row failed before a certificate was read.
+        enforce_tls_coverage(ssl_output)
         domain_output = load_result_file(args.domain_results, "domain_results.json")
         previous_history = load_json_if_exists(args.history)
         previous_state = load_json_if_exists(args.alert_state)
@@ -1129,6 +1256,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             transport = DiscordWebhookTransport.from_env(timeout=args.timeout)
         checkpoint = checkpoint_from_args(args)
+        batches = (
+            build_discord_batches(plan.events)
+            if transport is not None and plan.events
+            else ()
+        )
     except (ConfigError, MonitoringError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1179,52 +1311,36 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        post_with_retry(
-            transport,
-            build_discord_payload(plan.events),
+        delivered = deliver_batches(
+            plan,
+            batches,
+            transport=transport,
+            checkpoint=checkpoint,
+            alert_state_path=args.alert_state,
             max_attempts=args.max_attempts,
-            base_delay=args.retry_delay,
-            sleep=time.sleep,
+            retry_delay=args.retry_delay,
         )
     except DeliveryError as exc:
         print(f"error: {exc}", file=sys.stderr)
         print(
             f"alerts: {len(plan.events)} event(s), transport={args.transport}, "
-            "delivered=no"
+            f"acknowledged={getattr(exc, 'delivered', 0)}; remaining events "
+            "stay pending"
         )
         return 2
-
-    final_state = finalize_alert_state(
-        plan.alert_state,
-        plan.events,
-        delivered=True,
-    )
-    try:
-        write_json_atomic(args.alert_state, final_state)
-    except OSError as exc:
-        # The remote checkpoint still holds the pending batch, so the next run
-        # sends it again rather than losing it.
+    except (OSError, ValueError) as exc:
         print(
-            "error: alert delivered but local state could not be cleared; "
-            f"the batch may be retried: {exc}",
+            "error: alert batches were delivered up to the last acknowledged "
+            "checkpoint, but state could not be advanced; remaining events "
+            f"stay pending: {exc}",
             file=sys.stderr,
         )
         return 1
 
-    if checkpoint is not None:
-        try:
-            checkpoint.save(final_state)
-        except (OSError, ValueError) as exc:
-            # The alerts were acknowledged; the remote checkpoint still has the
-            # pending batch, so a retry can duplicate but cannot lose it.
-            print(
-                "error: alert delivered but checkpoint could not be cleared; "
-                f"the batch may be retried: {exc}",
-                file=sys.stderr,
-            )
-            return 1
-
-    print(f"alerts: {len(plan.events)} event(s), transport={args.transport}, delivered=yes")
+    print(
+        f"alerts: {len(plan.events)} event(s), transport={args.transport}, "
+        f"delivered=yes ({len(batches)} batch(es))"
+    )
     return 0
 
 

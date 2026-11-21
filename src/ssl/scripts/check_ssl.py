@@ -42,6 +42,7 @@ import socket
 import ssl
 import sys
 import tempfile
+import time
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -415,7 +416,14 @@ def _chain_summary(chain_der: list[bytes]) -> tuple[list[dict], bool]:
 
 
 def classify_hsts(headers: Mapping[str, str]) -> dict:
-    """Classify a Strict-Transport-Security header without over-claiming."""
+    """Classify a Strict-Transport-Security header without over-claiming.
+
+    ``max-age=0`` is a real header that disables HSTS: it is present and
+    syntactically valid, but ``enabled`` is false and ``status`` is
+    ``disabled``. Missing headers are ``absent``; malformed ones are
+    ``invalid``. ``indeterminate`` is reserved for a failed authenticated
+    HTTPS connection (see ``check_hsts``).
+    """
     value = None
     for key, header in headers.items():
         if str(key).lower() == "strict-transport-security":
@@ -425,6 +433,8 @@ def classify_hsts(headers: Mapping[str, str]) -> dict:
         return {
             "present": False,
             "valid": False,
+            "enabled": False,
+            "status": "absent",
             "max_age": None,
             "include_subdomains": False,
             "preload": False,
@@ -455,9 +465,19 @@ def classify_hsts(headers: Mapping[str, str]) -> dict:
 
     if max_age is None and error is None:
         error = "max-age directive is missing"
+    valid = max_age is not None and max_age >= 0
+    enabled = valid and max_age > 0
+    if not valid:
+        status = "invalid"
+    elif not enabled:
+        status = "disabled"
+    else:
+        status = "present"
     return {
         "present": True,
-        "valid": max_age is not None and max_age >= 0,
+        "valid": valid,
+        "enabled": enabled,
+        "status": status,
         "max_age": max_age,
         "include_subdomains": include_subdomains,
         "preload": preload,
@@ -466,10 +486,17 @@ def classify_hsts(headers: Mapping[str, str]) -> dict:
 
 
 def fetch_https_headers(host: str, port: int, *, timeout: float = TIMEOUT) -> dict[str, str]:
-    """Read response headers with a HEAD request. No certificate trust is implied."""
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
+    """Read headers over a separately authenticated HTTPS connection.
+
+    This connection uses the configured trust store (``CA_FILE`` or the system
+    store) with certificate and hostname verification enabled. A HSTS header is
+    only meaningful when the same origin proved its certificate and SAN; a
+    failed TLS connection is reported by ``check_hsts`` as indeterminate rather
+    than as missing HSTS.
+    """
+    context = ssl.create_default_context(cafile=CA_FILE)
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
     connection = http.client.HTTPSConnection(
         host,
         port,
@@ -501,10 +528,27 @@ def _hsts_not_applicable() -> dict:
         "checked": False,
         "present": None,
         "valid": None,
+        "enabled": None,
+        "status": "not_checked",
         "max_age": None,
         "include_subdomains": None,
         "preload": None,
         "error": None,
+    }
+
+
+def _hsts_indeterminate(error: str | None) -> dict:
+    return {
+        "applicable": True,
+        "checked": True,
+        "present": None,
+        "valid": None,
+        "enabled": None,
+        "status": "indeterminate",
+        "max_age": None,
+        "include_subdomains": None,
+        "preload": None,
+        "error": error or "HTTPS connection could not be authenticated",
     }
 
 
@@ -527,17 +571,9 @@ def check_hsts(
     try:
         headers = fetcher(host, port)
     except Exception as exc:
-        classification = classify_hsts({})
-        classification.update(
-            {
-                "applicable": True,
-                "checked": True,
-                "present": False,
-                "valid": False,
-                "error": _trim(str(exc), 180) or "HTTPS header request failed",
-            }
+        return _hsts_indeterminate(
+            _trim(str(exc), 180) or "HTTPS connection could not be authenticated"
         )
-        return classification
 
     classification = classify_hsts(headers)
     classification.update({"applicable": True, "checked": True})
@@ -559,7 +595,132 @@ class LocalTLSUnsupported(ssl.SSLError):
     """Local OpenSSL/Python cannot negotiate this protocol version."""
 
 
-def _read_line(sock: socket.socket, limit: int = 4096) -> str:
+STARTTLS_MAX_TOTAL_BYTES = 64 * 1024
+STARTTLS_MAX_TOTAL_LINES = 128
+STARTTLS_MAX_LINE_BYTES = 4096
+
+
+class _StartTLSBudget:
+    """Deadline and aggregate read/write budget for plaintext negotiation.
+
+    The deadline covers the whole exchange, not each socket call. Byte and line
+    caps count both directions, so a server cannot evade the limit by sending a
+    huge banner or by making us write an unbounded response. A deadline
+    overrun raises ``TimeoutError`` so the checker keeps its existing
+    ``timeout`` classification; a cap overrun raises ``StartTLSError`` so it
+    remains a protocol error (``ssl_error``).
+    """
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        *,
+        timeout: float,
+        clock: Callable[[], float],
+        max_bytes: int,
+        max_lines: int,
+        max_line_bytes: int,
+    ) -> None:
+        if timeout <= 0:
+            raise TimeoutError("STARTTLS negotiation deadline exceeded")
+        if max_bytes < 1 or max_lines < 1 or max_line_bytes < 1:
+            raise ValueError("STARTTLS budget limits must be positive")
+        self._sock = sock
+        self._clock = clock
+        self._deadline = clock() + timeout
+        self._max_bytes = max_bytes
+        self._max_lines = max_lines
+        self._max_line_bytes = max_line_bytes
+        self.bytes_read = 0
+        self.bytes_written = 0
+        self.lines_read = 0
+        self.lines_written = 0
+
+    def _check_deadline(self) -> float:
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            raise TimeoutError("STARTTLS negotiation deadline exceeded")
+        return remaining
+
+    def _set_timeout(self) -> None:
+        remaining = self._check_deadline()
+        setter = getattr(self._sock, "settimeout", None)
+        if callable(setter):
+            setter(remaining)
+
+    def _consume(
+        self,
+        *,
+        read: int = 0,
+        written: int = 0,
+        read_lines: int = 0,
+        written_lines: int = 0,
+    ) -> None:
+        self.bytes_read += read
+        self.bytes_written += written
+        self.lines_read += read_lines
+        self.lines_written += written_lines
+        if self.bytes_read + self.bytes_written > self._max_bytes:
+            raise StartTLSError("STARTTLS aggregate byte cap exceeded")
+        if self.lines_read + self.lines_written > self._max_lines:
+            raise StartTLSError("STARTTLS aggregate line cap exceeded")
+
+    def read_line(self) -> str:
+        self._check_deadline()
+        data = bytearray()
+        while len(data) < self._max_line_bytes:
+            self._set_timeout()
+            chunk = self._sock.recv(1)
+            self._check_deadline()
+            if not chunk:
+                break
+            self._consume(read=len(chunk))
+            data.extend(chunk)
+            if data.endswith(b"\n"):
+                self._consume(read_lines=1)
+                return data.decode("utf-8", errors="replace").rstrip("\r\n")
+        if data.endswith(b"\n"):
+            self._consume(read_lines=1)
+            return data.decode("utf-8", errors="replace").rstrip("\r\n")
+        if len(data) >= self._max_line_bytes:
+            raise StartTLSError("STARTTLS line length cap exceeded")
+        if data:
+            self._consume(read_lines=1)
+        return data.decode("utf-8", errors="replace").rstrip("\r\n")
+
+    def write(self, data: bytes) -> None:
+        self._check_deadline()
+        if len(data) > self._max_line_bytes:
+            raise StartTLSError("STARTTLS line length cap exceeded")
+        lines = data.count(b"\n")
+        self._consume(written=len(data), written_lines=lines)
+        self._set_timeout()
+        sendall = getattr(self._sock, "sendall", None)
+        if callable(sendall):
+            sendall(data)
+        else:
+            view = memoryview(data)
+            while view:
+                sent = self._sock.send(view)
+                if sent <= 0:
+                    raise StartTLSError("STARTTLS write failed")
+                view = view[sent:]
+        self._check_deadline()
+
+
+def _read_line(
+    sock: socket.socket,
+    limit: int = STARTTLS_MAX_LINE_BYTES,
+    *,
+    budget: _StartTLSBudget | None = None,
+) -> str:
+    """Read one line; with a budget, enforce aggregate and deadline limits.
+
+    Kept as a small compatibility helper for callers/tests that pass a socket
+    directly. Production STARTTLS negotiation always passes the budget.
+    """
+    if budget is not None:
+        return budget.read_line()
     data = bytearray()
     while len(data) < limit:
         chunk = sock.recv(1)
@@ -578,13 +739,13 @@ def _require_line(prefixes: tuple[str, ...], line: str, protocol: str) -> None:
         )
 
 
-def _starttls_smtp(sock: socket.socket) -> None:
-    greeting = _read_line(sock)
+def _starttls_smtp(sock: socket.socket, budget: _StartTLSBudget) -> None:
+    greeting = budget.read_line()
     _require_line(("220",), greeting, "smtp")
-    sock.sendall(b"EHLO certiwatch.local\r\n")
+    budget.write(b"EHLO certiwatch.local\r\n")
     capabilities: list[str] = []
     while True:
-        line = _read_line(sock)
+        line = budget.read_line()
         if not line:
             raise StartTLSError("SMTP closed the connection during EHLO")
         capabilities.append(line)
@@ -592,18 +753,18 @@ def _starttls_smtp(sock: socket.socket) -> None:
             break
     if not any("STARTTLS" in line.upper() for line in capabilities):
         raise StartTLSError("SMTP server does not advertise STARTTLS")
-    sock.sendall(b"STARTTLS\r\n")
-    _require_line(("220",), _read_line(sock), "smtp")
+    budget.write(b"STARTTLS\r\n")
+    _require_line(("220",), budget.read_line(), "smtp")
 
 
-def _starttls_imap(sock: socket.socket) -> None:
-    greeting = _read_line(sock)
+def _starttls_imap(sock: socket.socket, budget: _StartTLSBudget) -> None:
+    greeting = budget.read_line()
     upper = greeting.upper()
     if not (upper.startswith("* OK") or upper.startswith("* PREAUTH")):
         raise StartTLSError(f"IMAP greeting rejected STARTTLS: {greeting[:120]}")
-    sock.sendall(b"a001 STARTTLS\r\n")
+    budget.write(b"a001 STARTTLS\r\n")
     while True:
-        line = _read_line(sock)
+        line = budget.read_line()
         if not line:
             raise StartTLSError("IMAP closed the connection during STARTTLS")
         if line.upper().startswith("A001 "):
@@ -611,13 +772,22 @@ def _starttls_imap(sock: socket.socket) -> None:
             return
 
 
-def _starttls_pop3(sock: socket.socket) -> None:
-    _require_line(("+OK",), _read_line(sock), "pop3")
-    sock.sendall(b"STLS\r\n")
-    _require_line(("+OK",), _read_line(sock), "pop3")
+def _starttls_pop3(sock: socket.socket, budget: _StartTLSBudget) -> None:
+    _require_line(("+OK",), budget.read_line(), "pop3")
+    budget.write(b"STLS\r\n")
+    _require_line(("+OK",), budget.read_line(), "pop3")
 
 
-def _starttls_exchange(sock: socket.socket, protocol: str | None) -> None:
+def _starttls_exchange(
+    sock: socket.socket,
+    protocol: str | None,
+    *,
+    timeout: float = TIMEOUT,
+    clock: Callable[[], float] = time.monotonic,
+    max_bytes: int = STARTTLS_MAX_TOTAL_BYTES,
+    max_lines: int = STARTTLS_MAX_TOTAL_LINES,
+    max_line_bytes: int = STARTTLS_MAX_LINE_BYTES,
+) -> None:
     normalised = (protocol or "smtp").strip().lower()
     handlers = {
         "smtp": _starttls_smtp,
@@ -627,8 +797,15 @@ def _starttls_exchange(sock: socket.socket, protocol: str | None) -> None:
     handler = handlers.get(normalised)
     if handler is None:
         raise StartTLSUnsupported(f"unsupported STARTTLS protocol: {normalised}")
-    sock.settimeout(TIMEOUT)
-    handler(sock)
+    budget = _StartTLSBudget(
+        sock,
+        timeout=timeout,
+        clock=clock,
+        max_bytes=max_bytes,
+        max_lines=max_lines,
+        max_line_bytes=max_line_bytes,
+    )
+    handler(sock, budget)
 
 
 LEGACY_TLS_VERSIONS = ("tls10", "tls11")
@@ -831,6 +1008,9 @@ def _open_socket(
     if tls_mode == "starttls":
         try:
             _starttls_exchange(sock, protocol)
+            # The plaintext budget must not shorten the subsequent TLS
+            # handshake; restore the normal checker timeout.
+            sock.settimeout(TIMEOUT)
         except BaseException:
             try:
                 sock.close()
@@ -1156,6 +1336,8 @@ def _hsts_disabled() -> dict:
         "checked": False,
         "present": None,
         "valid": None,
+        "enabled": None,
+        "status": "not_checked",
         "max_age": None,
         "include_subdomains": None,
         "preload": None,
@@ -1191,14 +1373,8 @@ def _apply_configured_diagnostics(
             try:
                 result["hsts"] = check_hsts(host, port, applicable=True)
             except Exception as exc:
-                result["hsts"] = _hsts_disabled()
-                result["hsts"].update(
-                    {
-                        "checked": True,
-                        "present": False,
-                        "valid": False,
-                        "error": _trim(str(exc), 180) or "HSTS check failed",
-                    }
+                result["hsts"] = _hsts_indeterminate(
+                    _trim(str(exc), 180) or "HSTS check failed"
                 )
         else:
             result["hsts"] = _hsts_disabled()

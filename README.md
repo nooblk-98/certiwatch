@@ -90,14 +90,16 @@ domain = "example.com"        # host, host:port or URL
 registration = true           # registration checks are opt-in
 tags = ["public", "core"]     # public metadata
 group = "corporate"           # public metadata
-owner = "ops@example.com"     # private: never written to results/history
-notes = "Primary site."       # private: never written to results/history
+owner = "ops@example.com"     # not emitted, but this TOML is public in Git
+notes = "Primary site."       # not emitted, but this TOML is public in Git
 ```
 
 `src/config.py` rejects unknown keys, duplicate TLS endpoints or registration
 domains, a port conflict, non-descending thresholds and targets with both
-checks disabled. Only `tags` and `group` are public; `owner` and `notes` stay
-local. See `docs/monitoring-lifecycle.md` for the full contract.
+checks disabled. `owner` and `notes` are not copied into generated files, but
+**the tracked TOML itself is public**: treat every value in it as public and
+never put secrets there. See `docs/monitoring-lifecycle.md` for the full
+contract.
 
 ### domains.conf (legacy)
 
@@ -409,8 +411,9 @@ skipped rather than writing state or publishing.
 6. Runs `src/monitor_state.py`: writes the public history snapshot, writes the
    pending batch to the remote KV checkpoint, and only then delivers opt-in
    events. A checkpoint failure means zero sends.
-7. Saves public history back to the Actions cache and pushes private state back
-   to KV, even if delivery reported a warning.
+7. Saves public history back to the Actions cache even after a delivery
+   warning. `monitor_state.py` owns all private checkpoint writes; there is no
+   redundant post-run KV put.
 8. Stages the atomic publish directory with `scripts/build_dist.py`, including
    the feeds and history.
 9. Deploys `dist/` to Cloudflare Pages, from `main` only.
@@ -526,8 +529,15 @@ the dashboard publish.
 or `--checkpoint kv` (CI). The workflow chooses `kv` only when
 `CERTIWATCH_STATE_KV_NAMESPACE` is configured and refuses to enable alerts
 otherwise. With delivery disabled, pending events are preserved rather than
-discarded. The private state is never written to the repository, a Pages
-bundle, an Actions cache or an uploaded artifact.
+discarded; the backlog can grow while alerts are off and is bounded by the 2 MB
+KV state limit. A PUT failure, including a 404, is a checkpoint failure and
+sends nothing; a missing GET key is a first run.
+
+Messages are split into bounded batches. Every event is sent exactly once per
+attempt, and after each acknowledged batch only the unacknowledged events remain
+in the local and remote state. An oversized single event fails the run rather
+than being truncated. The private state is never written to the repository, a
+Pages bundle, an Actions cache or an uploaded artifact.
 
 ### Required GitHub configuration
 

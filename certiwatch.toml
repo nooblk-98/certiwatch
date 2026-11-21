@@ -5,8 +5,10 @@
 # local compatibility input only when this file is absent; an invalid TOML
 # file is always an error and never falls back silently.
 #
-# `owner` and `notes` are private: they are never written to ssl_results.json,
-# domain_results.json or history.json. Only `tags` and `group` are public.
+# `owner` and `notes` are not copied into ssl_results.json,
+# domain_results.json, history.json, feeds or Discord messages. But this file is
+# tracked in Git: every value here is public. Do not put secrets in owner,
+# notes, tags or group. Only `tags` and `group` are emitted as public metadata.
 
 version = 1
 

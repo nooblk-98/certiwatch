@@ -75,7 +75,6 @@ def test_public_history_uses_cache_only_on_main() -> None:
 def test_private_state_uses_kv_not_cache_or_artifact() -> None:
     publish = publish_job()
     assert "scripts/alert_state_store.py pull" in publish
-    assert "scripts/alert_state_store.py push" in publish
     assert "CERTIWATCH_STATE_KV_NAMESPACE" in publish
     assert "CERTIWATCH_STATE_KV_TOKEN" in publish
     assert "actions/upload-artifact" not in publish
@@ -92,10 +91,11 @@ def test_remote_checkpoint_is_chosen_before_discord() -> None:
     assert publish.index("checkpoint=kv") < publish.index('--checkpoint "$checkpoint"')
 
 
-def test_state_is_pushed_even_after_a_failed_send() -> None:
+def test_no_redundant_post_run_private_state_put() -> None:
     publish = publish_job()
-    push_at = publish.index("scripts/alert_state_store.py push")
-    assert "if: always()" in publish[push_at - 500 : push_at]
+    assert "scripts/alert_state_store.py push" not in publish
+    assert "checkpoint=kv" in publish
+    assert "--checkpoint" in publish
 
 
 def test_bundle_is_built_before_deploy_and_wrangler_is_pinned() -> None:

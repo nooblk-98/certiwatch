@@ -50,8 +50,8 @@ registration = false            # default: false (opt-in)
 ssl_port = 443                  # optional per-entry TLS port
 tags = ["public", "core"]
 group = "corporate"
-owner = "ops@example.com"       # private
-notes = "Primary site."         # private
+owner = "ops@example.com"       # not emitted; tracked TOML is public in Git
+notes = "Primary site."         # not emitted; tracked TOML is public in Git
 ```
 
 Rules enforced by `src/config.py`:
@@ -65,8 +65,10 @@ Rules enforced by `src/config.py`:
 - Duplicate TLS endpoints and duplicate registration domains are rejected.
 - `thresholds` must contain exactly four non-negative, strictly descending
   integers.
-- Only `tags` and `group` are public. `owner` and `notes` remain on the local
-  `Target` and never reach result files, history or Discord messages.
+- Only `tags` and `group` are emitted as public metadata. `owner` and `notes`
+  stay local to the loaded `Target` and never reach result files, history or
+  Discord messages. The tracked `certiwatch.toml` itself is public in Git, so
+  every value in it—including owner/notes—must be treated as public.
 - An existing TOML file that is invalid is a hard error. There is **no silent
   fallback** to `ssl.conf` / `domains.conf`.
 
@@ -158,6 +160,14 @@ the dynamic file list to the allowlist check, and swaps the whole bundle
 atomically. See the module docstring for the exact JSON/ICS fields and the
 README for the endpoint table.
 
+## TLS coverage before state
+
+`monitor_state.py` calls the same TLS-coverage gate as the publish builder
+before it reads previous history/state or writes anything. A run in which every
+SSL row is a DNS, connect, handshake or input failure exits `1` with both
+`history.json` and the private state byte-for-byte unchanged, and no checkpoint
+or Discord call is made. Genuine `valid`, `expired` or `invalid` verdicts pass.
+
 ## Private alert state
 
 `.certiwatch/alert_state.json` is separate and structurally different:
@@ -227,8 +237,7 @@ Consequences:
 - a crash after a successful send but before the clearing write leaves the
   batch pending, so the next run may send it again;
 - a failed checkpoint-clear write after a 2xx acknowledgement leaves the remote
-  batch pending, so a retry may duplicate it (the workflow's post-run push may
-  clear it first if the local state was already cleared);
+  batch pending, so a retry may duplicate it;
 - a crash after the checkpoint but before the send similarly leaves pending
   events for the next run.
 
@@ -236,6 +245,27 @@ This is **at-least-once**, not exactly-once. A duplicate alert is the accepted
 cost; an alert lost because the runner vanished is not. `--transport discord`
 requires `--checkpoint local` or `kv`; CI always uses `kv` and refuses to send
 without a remote checkpoint.
+
+### Disabled-send backlog and KV failures
+
+When delivery is disabled (`--transport none`), no events are discarded. The
+pending list is rewritten unchanged, so a later enabled run sends the backlog;
+the list can grow while alerts are off and is bounded only by the 2 MB KV state
+limit. Exceeding that limit fails the checkpoint closed and sends nothing.
+
+KV failure behavior is deliberate:
+
+- a missing **GET** key is a first run, not an error;
+- a **PUT 404 or any other PUT failure** is a checkpoint failure, never success;
+- a pull failure stops the job before `monitor_state.py`;
+- a pre-send checkpoint failure aborts with zero sends;
+- a post-acknowledgement checkpoint failure can duplicate the acknowledged
+  batch on the next run; it cannot lose it.
+
+Messages are split into bounded batches of at most 2000 characters. Every event
+belongs to exactly one batch; the code refuses an oversized single event rather
+than silently truncating or dropping it. After each acknowledged batch, the
+local and remote states retain only the unacknowledged events.
 
 ## Discord delivery
 
@@ -368,7 +398,7 @@ When alerts are enabled, use `--transport discord --checkpoint kv`; the workflow
 chooses `kv` only when `CERTIWATCH_STATE_KV_NAMESPACE` is configured and refuses
 to enable Discord otherwise. With no KV namespace it stays at
 `--transport none --checkpoint none`, preserving any pulled pending events
-locally and via the post-run push guard.
+locally (no remote checkpoint is claimed without KV).
 
 ### Public history cache
 
@@ -385,9 +415,12 @@ history as optional, so publish is never blocked.
 configured namespace/key. Configuration comes from
 `CERTIWATCH_STATE_KV_TOKEN`, `CERTIWATCH_STATE_KV_NAMESPACE` and
 `CLOUDFLARE_ACCOUNT_ID`; the token is never a CLI argument and never appears in
-output. A missing key is a first run. The workflow pulls before
-`monitor_state.py` and pushes after it with `if: always()`, so pending events
-survive a failed send. The path is never uploaded as an artifact or cache.
+output. A missing **GET** key is a first run. A **PUT 404** or any other PUT
+failure is a hard checkpoint failure and sends nothing.
+
+The workflow pulls state before `monitor_state.py`; the CLI then owns every
+checkpoint write before and after each acknowledged batch. There is no redundant
+post-run push step. The path is never uploaded as an artifact or cache.
 
 ## Remaining verification
 

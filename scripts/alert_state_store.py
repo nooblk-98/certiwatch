@@ -56,8 +56,12 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 KEY = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
-class StoreError(Exception):
-    """A configuration, local-file or Cloudflare KV failure."""
+class StoreError(ValueError):
+    """A configuration, local-file or Cloudflare KV failure.
+
+    Subclasses ``ValueError`` so callers that guard state failures as
+    configuration errors catch this without importing the adapter.
+    """
 
 
 def _identifier(value: str | None, label: str) -> str:
@@ -101,7 +105,12 @@ def _request(
     body: bytes | None = None,
     timeout: float = 15.0,
 ) -> bytes | None:
-    """Return the response body, or None for 404. Never leak the token/body."""
+    """Return the response body. Only a GET 404 means "absent".
+
+    A PUT 404 is a failure: writing a checkpoint or pushing state and getting
+    "not found" back must never be reported as success. Never leak the token or
+    the state body.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": "CertiWatch/1.0",
@@ -123,7 +132,7 @@ def _request(
                 exc.close()
             except OSError:
                 pass
-        if code == 404:
+        if code == 404 and method == "GET":
             return None
         raise StoreError(f"Cloudflare KV returned HTTP {code}") from None
     except (urllib.error.URLError, TimeoutError, OSError):

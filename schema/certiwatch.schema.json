@@ -133,12 +133,12 @@
           "owner": {
             "type": "string",
             "minLength": 1,
-            "description": "Private metadata. Never written to public result or history JSON."
+            "description": "Not written to public result or history JSON, but the tracked TOML is public in Git. Do not put secrets here."
           },
           "notes": {
             "type": "string",
             "minLength": 1,
-            "description": "Private metadata. Never written to public result or history JSON."
+            "description": "Not written to public result or history JSON, but the tracked TOML is public in Git. Do not put secrets here."
           }
         },
         "anyOf": [

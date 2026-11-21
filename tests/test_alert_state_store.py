@@ -123,6 +123,31 @@ def test_push_uploads_the_exact_state(monkeypatch, tmp_path):
     assert request.headers["Authorization"] == f"Bearer {TOKEN}"
 
 
+def test_put_404_is_a_failure(monkeypatch, tmp_path):
+    configure(monkeypatch)
+    source = tmp_path / "alert_state.json"
+    source.write_text(json.dumps(STATE), encoding="utf-8")
+    recorder = Recorder(
+        urllib.error.HTTPError(f"{store.API_BASE}/x", 404, "not found", {}, None)
+    )
+    monkeypatch.setattr(store.urllib.request, "urlopen", recorder)
+
+    code = store.main(["push", "--in", str(source)])
+
+    assert code == 1
+
+
+def test_kv_checkpoint_put_404_is_a_failure(monkeypatch):
+    configure(monkeypatch)
+    recorder = Recorder(
+        urllib.error.HTTPError(f"{store.API_BASE}/x", 404, "not found", {}, None)
+    )
+    monkeypatch.setattr(store.urllib.request, "urlopen", recorder)
+
+    with pytest.raises(store.StoreError, match="HTTP 404"):
+        store.KvCheckpoint.from_env().save(STATE)
+
+
 def test_missing_token_never_reaches_the_network(monkeypatch, tmp_path):
     monkeypatch.delenv(store.TOKEN_ENV, raising=False)
     monkeypatch.setenv(store.NAMESPACE_ENV, NAMESPACE)

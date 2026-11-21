@@ -11,7 +11,9 @@ Legacy ``ssl.conf`` / ``domains.conf`` files remain readable *only* when no
 tags, group, owner or notes. If a TOML file exists but cannot be parsed or
 validated, loading fails; it never falls back silently to the old files.
 
-Privacy rule: ``owner`` and ``notes`` stay on the Target for local use only.
+Privacy rule: ``owner`` and ``notes`` are not emitted into result files,
+history, feeds or alerts. The tracked ``certiwatch.toml`` is public in Git, so
+those values are still public and must not contain secrets.
 ``Target.public_metadata()`` exposes exactly ``tags`` and ``group``, which are
 the only target metadata the checkers and public history may write.
 """
@@ -154,7 +156,9 @@ class Target:
 
     ``host`` keeps a leading ``www.`` for TLS checks. Registration keys strip
     it because www and the bare name share one registration. ``owner`` and
-    ``notes`` are private; use :meth:`public_metadata` for anything published.
+    ``notes`` are not emitted; use :meth:`public_metadata` for anything
+    published. Because the TOML file is tracked, its owner/notes values are
+    still public in Git.
     """
 
     host: str
