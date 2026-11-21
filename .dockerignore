@@ -1,0 +1,18 @@
+.git
+.gitignore
+.dockerignore
+target
+data
+feeds
+.env
+.env.*
+*.log
+*.tmp
+
+# Not needed to build the binary.
+tests
+parity
+docs
+schema
+README.md
+compose.yaml

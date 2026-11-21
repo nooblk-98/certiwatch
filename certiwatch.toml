@@ -1,9 +1,8 @@
-# CertiWatch unified configuration.
+# CertiWatch target configuration.
 #
-# Loaded by src/ssl/scripts/check_ssl.py, src/domain/scripts/check_domains.py
-# and src/monitor_state.py. The legacy ssl.conf/domains.conf files remain a
-# local compatibility input only when this file is absent; an invalid TOML
-# file is always an error and never falls back silently.
+# This is the only target configuration the service reads. Mount it read-only
+# in the container; CertiWatch never writes to it and always rejects a missing,
+# unreadable or invalid file instead of falling back to anything else.
 #
 # `owner` and `notes` are not copied into ssl_results.json,
 # domain_results.json, history.json, feeds or Discord messages. But this file is

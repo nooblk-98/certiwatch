@@ -1,0 +1,111 @@
+name: Publish release image
+
+# Release-only publishing. This workflow never creates a release, never deploys
+# the application and never pushes on a branch or pull request. A maintainer
+# publishes a vMAJOR.MINOR.PATCH release; this job verifies its tag, verifies
+# that the checked-out commit is on main, then pushes one versioned image to
+# GHCR and records its digest.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish ghcr.io/nooblk-98/certiwatch
+    if: >-
+      github.repository == 'nooblk-98/certiwatch' &&
+      github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version and main ancestry
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release tag must match vMAJOR.MINOR.PATCH, got: $RELEASE_TAG"
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$CARGO_VERSION" != "$VERSION" ]]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match release $VERSION"
+            exit 1
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+          git fetch --no-tags origin main --quiet
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::release commit $SHA is not on main"
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "Validated $RELEASE_TAG at $SHA on main"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Sign in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the versioned image
+        id: push
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/nooblk-98/certiwatch:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      - name: Record the image digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::build did not return an image digest"
+            exit 1
+          fi
+          {
+            echo "### CertiWatch image published"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| image | \`ghcr.io/nooblk-98/certiwatch:$VERSION\` |"
+            echo "| digest | \`$DIGEST\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
