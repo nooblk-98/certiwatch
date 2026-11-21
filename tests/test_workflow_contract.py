@@ -108,8 +108,17 @@ def test_triggers_are_main_and_named_development_branches() -> None:
     assert "pull_request:" not in triggers
     assert "pull_request_target" not in triggers
     assert "workflow_run" not in triggers
-    for branch in ("main", "dev", "develop", "development", '"development/**"'):
+    for branch in (
+        "main",
+        "dev",
+        "develop",
+        "development",
+        '"development/*"',
+        '"development/*/*"',
+    ):
         assert re.search(rf"(?m)^      - {re.escape(branch)}$", triggers), branch
+    # An unbounded prefix would not be expressible as an environment policy.
+    assert "development/**" not in triggers
     assert re.search(r'(?m)^\s+- cron: "30 0 \* \* \*"$', triggers)
     assert "workflow_dispatch:" in triggers
     # Feature branches, tags and other refs are not deployment triggers.
@@ -138,6 +147,38 @@ def test_production_is_main_only_and_depends_on_verify() -> None:
     assert "pages deploy" in publish.lower()
 
 
+def test_production_uses_environment_only_credentials() -> None:
+    publish = strip_comments(job_block("publish"))
+    assert "environment:" in publish
+    assert "name: certiwatch-production" in publish
+    for name in (
+        "CERTIWATCH_PRODUCTION_PAGES_API_TOKEN",
+        "CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID",
+        "CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK",
+        "CERTIWATCH_PRODUCTION_STATE_KV_TOKEN",
+    ):
+        assert f"secrets.{name}" in publish, name
+    # The trusted, non-secret account id is the cross-check anchor.
+    assert "vars.CERTIWATCH_PRODUCTION_ACCOUNT_ID" in publish
+    assert '"$PAGES_ACCOUNT" != "$TRUSTED_ACCOUNT"' in publish
+
+
+def test_no_workflow_reads_retired_repository_secrets() -> None:
+    retired = (
+        "secrets.CLOUDFLARE_API_TOKEN",
+        "secrets.CLOUDFLARE_ACCOUNT_ID",
+        "secrets.CERTIWATCH_DISCORD_WEBHOOK",
+        "secrets.CERTIWATCH_STATE_KV_TOKEN",
+        "vars.CLOUDFLARE_PAGES_PROJECT",
+        "vars.CERTIWATCH_STATE_KV_NAMESPACE",
+        "vars.CERTIWATCH_ALERTS_ENABLED",
+    )
+    for path in WORKFLOWS.glob("*.yml"):
+        content = read(path)
+        for name in retired:
+            assert name not in content, f"{path.name} still reads {name}"
+
+
 def test_preview_is_push_only_on_development_branches() -> None:
     preview = strip_comments(job_block("publish-preview"))
     assert "github.event_name == 'push'" in preview
@@ -160,10 +201,17 @@ def test_preview_uses_environment_scoped_credentials_only() -> None:
     assert "name: certiwatch-preview" in preview
     assert "secrets.CLOUDFLARE_PREVIEW_API_TOKEN" in preview
     assert "secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID" in preview
-    # Never fall back to the production credentials if a preview secret is
+    # Never fall back to production credentials if a preview secret is
     # missing; the job fails in its explicit credential check instead.
-    assert "secrets.CLOUDFLARE_API_TOKEN" not in preview
-    assert "secrets.CLOUDFLARE_ACCOUNT_ID" not in preview
+    for production_secret in (
+        "secrets.CERTIWATCH_PRODUCTION_PAGES_API_TOKEN",
+        "secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID",
+        "secrets.CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK",
+        "secrets.CERTIWATCH_PRODUCTION_STATE_KV_TOKEN",
+        "secrets.CLOUDFLARE_API_TOKEN",
+        "secrets.CLOUDFLARE_ACCOUNT_ID",
+    ):
+        assert production_secret not in preview, production_secret
 
 
 def test_preview_never_touches_production_state_or_alerts() -> None:
@@ -182,7 +230,7 @@ def test_preview_never_touches_production_state_or_alerts() -> None:
 
 def test_preview_checks_credentials_and_validates_deploy_values() -> None:
     preview = strip_comments(job_block("publish-preview"))
-    assert "Verify preview credentials" in preview
+    assert "Verify preview credentials and account separation" in preview
     assert "Resolve preview target" in preview
     assert "GITHUB_ENV" in preview
     # The branch is mapped with an allowlist, not passed through raw.
@@ -193,6 +241,34 @@ def test_preview_checks_credentials_and_validates_deploy_values() -> None:
     assert "${{ env.CERTIWATCH_PAGES_PROJECT }}" in command
     assert "github.ref" not in command
     assert "${{ vars." not in command
+
+
+def test_preview_requires_explicit_distinct_project_and_account() -> None:
+    preview = strip_comments(job_block("publish-preview"))
+    # The preview project is required; there is no same-project fallback.
+    assert 'vars.CERTIWATCH_PREVIEW_PROJECT' in preview
+    assert 'project="${PAGES_PROJECT:-}"' in preview
+    assert "PAGES_PROJECT:-certiwatch" not in preview
+    # Account and project separation checks against trusted production values.
+    assert "vars.CERTIWATCH_PRODUCTION_ACCOUNT_ID" in preview
+    assert "vars.CERTIWATCH_PRODUCTION_PAGES_PROJECT" in preview
+    assert '"$PREVIEW_ACCOUNT" = "$production_account"' in preview
+    assert '"$PREVIEW_PROJECT" = "$production_project"' in preview
+    # Cloudflare Pages edit tokens are account-scoped; the isolation boundary
+    # is a separate account, not a project-scoped token.
+    workflow = read(WORKFLOW)
+    assert "Pages edit are account-scoped" in workflow
+    assert "real isolation boundary" in workflow
+
+
+def test_preview_alias_has_deterministic_collision_resistance() -> None:
+    preview = strip_comments(job_block("publish-preview"))
+    assert "FULL_REF: ${{ github.ref }}" in preview
+    assert "sha256sum" in preview
+    assert "cut -c1-8" in preview
+    assert 'branch="${slug}-${digest}"' in preview
+    # The hash is of the full ref, not the sanitised slug.
+    assert 'printf \'%s\' "$FULL_REF"' in preview
 
 
 def test_production_deploy_uses_validated_project() -> None:
@@ -266,3 +342,19 @@ def test_checkout_never_persists_credentials() -> None:
     for job in ("publish", "publish-preview"):
         assert "persist-credentials: false" in job_block(job), job
     assert "persist-credentials: false" in read(VERIFY)
+
+
+def test_readme_documents_activation_gates_and_public_previews() -> None:
+    readme = read(ROOT / "README.md")
+    for token in (
+        "certiwatch-production",
+        "certiwatch-preview",
+        "CERTIWATCH_PRODUCTION_ACCOUNT_ID",
+        "CERTIWATCH_PREVIEW_PROJECT",
+        "development/*/*",
+        "two levels under `development/`",
+    ):
+        assert token in readme, token
+    assert "Delete all of those old repository-level secrets" in readme
+    assert "Protect `main`" in readme
+    assert "Preview results are public" in readme

@@ -1,11 +1,14 @@
 name: CertiWatch checks
 
 # The single workflow that owns every Cloudflare Pages deployment:
-#   * main                         -> production publish
+#   * main                              -> production publish
 #   * dev, develop, development,
-#     development/**               -> preview publish only
-# Pull requests use the dedicated, secret-free pr-verify.yml workflow and never
-# publish. Arbitrary feature branches, tags and pull requests are not deployed.
+#     development/*, development/*/*   -> preview publish only
+# Two levels under development/ is the supported maximum, so the GitHub
+# environment policy can list the same patterns: environment rules match one
+# path segment per `*` and do not let `**` cross a slash. Pull requests use the
+# dedicated, secret-free pr-verify.yml workflow and never publish. Arbitrary
+# feature branches, tags and pull requests are not deployed.
 on:
   push:
     branches:
@@ -13,7 +16,8 @@ on:
       - dev
       - develop
       - development
-      - "development/**"
+      - "development/*"
+      - "development/*/*"
     # Only changes that alter what is checked, rendered or published re-run
     # the checks and redeploy.
     paths:
@@ -61,6 +65,11 @@ jobs:
     # whether the run was a push, the daily schedule or a manual dispatch.
     needs: verify
     if: github.ref == 'refs/heads/main'
+    # Production credentials live only in this environment. Its deployment
+    # branch policy must allow main and nothing else, so a job on any other ref
+    # cannot read them even if the workflow file changes.
+    environment:
+      name: certiwatch-production
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -124,18 +133,40 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Resolve Pages project
-        # The project name is optional configuration. Validate it against a
-        # strict allowlist here, then interpolate only the validated value into
-        # the deploy command, so a repository variable can never smuggle extra
-        # shell arguments into the deploy step.
+      - name: Verify production credentials
+        # Fail closed on a missing or mismatched account instead of deploying
+        # with whatever secret happens to be present. Values are never printed.
         env:
-          PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT }}
+          PAGES_TOKEN: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_API_TOKEN }}
+          PAGES_ACCOUNT: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
+          TRUSTED_ACCOUNT: ${{ vars.CERTIWATCH_PRODUCTION_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAGES_TOKEN:-}" ] || [ -z "${PAGES_ACCOUNT:-}" ]; then
+            echo "::error::The certiwatch-production environment needs CERTIWATCH_PRODUCTION_PAGES_API_TOKEN and CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID secrets."
+            exit 1
+          fi
+          if [ -z "${TRUSTED_ACCOUNT:-}" ]; then
+            echo "::error::Repository variable CERTIWATCH_PRODUCTION_ACCOUNT_ID must name the production Cloudflare account."
+            exit 1
+          fi
+          if [ "$PAGES_ACCOUNT" != "$TRUSTED_ACCOUNT" ]; then
+            echo "::error::The production Pages account secret does not match the trusted CERTIWATCH_PRODUCTION_ACCOUNT_ID setting."
+            exit 1
+          fi
+
+      - name: Resolve Pages project
+        # The project name is optional production configuration. Validate it
+        # against a strict allowlist here, then interpolate only the validated
+        # value into the deploy command, so a repository variable can never
+        # smuggle extra shell arguments into the deploy step.
+        env:
+          PAGES_PROJECT: ${{ vars.CERTIWATCH_PRODUCTION_PAGES_PROJECT }}
         run: |
           set -euo pipefail
           project="${PAGES_PROJECT:-certiwatch}"
           if ! [[ "$project" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || [ "${#project}" -gt 58 ]; then
-            echo "::error::CLOUDFLARE_PAGES_PROJECT must be 1-58 lowercase letters, digits or hyphens, starting and ending with a letter or digit."
+            echo "::error::CERTIWATCH_PRODUCTION_PAGES_PROJECT must be 1-58 lowercase letters, digits or hyphens, starting and ending with a letter or digit."
             exit 1
           fi
           printf 'CERTIWATCH_PAGES_PROJECT=%s\n' "$project" >> "$GITHUB_ENV"
@@ -168,21 +199,21 @@ jobs:
         # Private state must not use an Actions cache or artifact in a public
         # repository. A dedicated, narrowly scoped KV namespace is optional;
         # without it the CLI never sends and no durable state is claimed.
-        if: vars.CERTIWATCH_STATE_KV_NAMESPACE != ''
+        if: vars.CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE != ''
         env:
-          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_STATE_KV_TOKEN }}
-          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_STATE_KV_NAMESPACE }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_PRODUCTION_STATE_KV_TOKEN }}
+          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
         run: python3 scripts/alert_state_store.py pull --out .certiwatch/alert_state.json
 
       - name: Build public history and private alert state
         id: monitor
         env:
-          CERTIWATCH_DISCORD_WEBHOOK: ${{ secrets.CERTIWATCH_DISCORD_WEBHOOK }}
-          CERTIWATCH_ALERTS_ENABLED: ${{ vars.CERTIWATCH_ALERTS_ENABLED }}
-          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_STATE_KV_TOKEN }}
-          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_STATE_KV_NAMESPACE }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CERTIWATCH_DISCORD_WEBHOOK: ${{ secrets.CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK }}
+          CERTIWATCH_ALERTS_ENABLED: ${{ vars.CERTIWATCH_PRODUCTION_ALERTS_ENABLED }}
+          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_PRODUCTION_STATE_KV_TOKEN }}
+          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           transport=none
@@ -192,11 +223,11 @@ jobs:
           fi
           if [ "${CERTIWATCH_ALERTS_ENABLED:-false}" = "true" ]; then
             if [ -z "${CERTIWATCH_DISCORD_WEBHOOK:-}" ]; then
-              echo "::error::CERTIWATCH_ALERTS_ENABLED is true but CERTIWATCH_DISCORD_WEBHOOK is not set."
+              echo "::error::Production alerts are enabled but CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK is not set."
               exit 1
             fi
             if [ "$checkpoint" != "kv" ]; then
-              echo "::error::Discord alerts require CERTIWATCH_STATE_KV_NAMESPACE for a remote checkpoint."
+              echo "::error::Production Discord alerts require CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE for a remote checkpoint."
               exit 1
             fi
             transport=discord
@@ -239,8 +270,8 @@ jobs:
         # never raw ref or variable text.
         uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd  # v3.15.0
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_API_TOKEN }}
+          accountId: ${{ secrets.CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID }}
           # Production deploys use the main branch of the Pages project.
           command: pages deploy dist --project-name=${{ env.CERTIWATCH_PAGES_PROJECT }} --branch=main
 
@@ -255,10 +286,11 @@ jobs:
        github.ref == 'refs/heads/develop' ||
        github.ref == 'refs/heads/development' ||
        startsWith(github.ref, 'refs/heads/development/'))
-    # Environment-scoped preview credentials. The environment must carry
-    # CLOUDFLARE_PREVIEW_API_TOKEN and CLOUDFLARE_PREVIEW_ACCOUNT_ID, and its
-    # deployment-branch policy should allow only dev, develop, development and
-    # development/*. Production secrets are never referenced by this job.
+    # Preview credentials live only in this environment, in a separate
+    # Cloudflare account with a distinct project. Its deployment-branch policy
+    # must allow exactly dev, develop, development, development/* and
+    # development/*/* — the same patterns and depth as the trigger above.
+    # Production secrets are never referenced.
     environment:
       name: certiwatch-preview
     runs-on: ubuntu-latest
@@ -278,40 +310,79 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Verify preview credentials
-        # Fail closed when the preview environment is not configured, instead of
-        # falling back to any repository-level production credential.
+      - name: Verify preview credentials and account separation
+        # Fail closed when the environment is incomplete, and refuse a preview
+        # that resolves to the production account or project. Cloudflare API
+        # tokens with Pages edit are account-scoped, so only a different
+        # account is a real isolation boundary; these checks catch the common
+        # misconfiguration but do not replace that boundary. Values are never
+        # printed.
         env:
           PREVIEW_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
           PREVIEW_ACCOUNT: ${{ secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID }}
+          PRODUCTION_ACCOUNT: ${{ vars.CERTIWATCH_PRODUCTION_ACCOUNT_ID }}
+          PRODUCTION_PROJECT: ${{ vars.CERTIWATCH_PRODUCTION_PAGES_PROJECT }}
+          PREVIEW_PROJECT: ${{ vars.CERTIWATCH_PREVIEW_PROJECT }}
         run: |
           set -euo pipefail
           if [ -z "${PREVIEW_TOKEN:-}" ] || [ -z "${PREVIEW_ACCOUNT:-}" ]; then
             echo "::error::The certiwatch-preview environment needs CLOUDFLARE_PREVIEW_API_TOKEN and CLOUDFLARE_PREVIEW_ACCOUNT_ID secrets."
             exit 1
           fi
+          if [ -z "${PREVIEW_PROJECT:-}" ]; then
+            echo "::error::The certiwatch-preview environment needs the CERTIWATCH_PREVIEW_PROJECT variable; previews never default to the production project."
+            exit 1
+          fi
+          production_account="${PRODUCTION_ACCOUNT:-}"
+          if [ -z "$production_account" ]; then
+            echo "::error::Repository variable CERTIWATCH_PRODUCTION_ACCOUNT_ID must name the production Cloudflare account."
+            exit 1
+          fi
+          if [ "$PREVIEW_ACCOUNT" = "$production_account" ]; then
+            echo "::error::Preview and production resolve to the same Cloudflare account; previews require a separate account."
+            exit 1
+          fi
+          production_project="${PRODUCTION_PROJECT:-certiwatch}"
+          if [ "$PREVIEW_PROJECT" = "$production_project" ]; then
+            echo "::error::Preview and production project names must differ."
+            exit 1
+          fi
 
       - name: Resolve preview target
-        # Map the ref to a safe Pages branch alias and validate the optional
-        # project variable. Only these allowlisted values are interpolated into
-        # the deploy command; raw ref or variable text never is.
+        # Map the ref to a safe, collision-resistant Pages alias and validate
+        # the required project variable. The slug alone is ambiguous
+        # (development/team-feature and development/team/feature collapse
+        # together), so a short hash of the full ref is always appended. Only
+        # these allowlisted values are interpolated into the deploy command;
+        # raw ref or variable text never is.
         env:
           REF_NAME: ${{ github.ref_name }}
-          PAGES_PROJECT: ${{ vars.CLOUDFLARE_PREVIEW_PROJECT }}
+          FULL_REF: ${{ github.ref }}
+          PAGES_PROJECT: ${{ vars.CERTIWATCH_PREVIEW_PROJECT }}
         run: |
           set -euo pipefail
-          branch=$(printf '%s' "$REF_NAME" \
+          slug=$(printf '%s' "$REF_NAME" \
             | tr '[:upper:]/' '[:lower:]-' \
             | tr -cd 'a-z0-9._-' \
             | cut -c1-48)
-          branch="${branch%-}"
-          if ! [[ "$branch" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+          slug="${slug%-}"
+          if ! [[ "$slug" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
             echo "::error::Ref '$REF_NAME' cannot be mapped to a safe Cloudflare Pages branch name."
             exit 1
           fi
-          project="${PAGES_PROJECT:-certiwatch}"
+          digest=$(printf '%s' "$FULL_REF" | sha256sum | cut -c1-8)
+          branch="${slug}-${digest}"
+          if ! [[ "$branch" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::Ref '$REF_NAME' produced an unsafe Cloudflare Pages branch name."
+            exit 1
+          fi
+          project="${PAGES_PROJECT:-}"
+          if [ -z "$project" ]; then
+            echo "::error::The certiwatch-preview environment needs the CERTIWATCH_PREVIEW_PROJECT variable; previews never default to the production project."
+            exit 1
+          fi
           if ! [[ "$project" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || [ "${#project}" -gt 58 ]; then
-            echo "::error::CLOUDFLARE_PREVIEW_PROJECT must be 1-58 lowercase letters, digits or hyphens, starting and ending with a letter or digit."
+            echo "::error::CERTIWATCH_PREVIEW_PROJECT must be 1-58 lowercase letters, digits or hyphens, starting and ending with a letter or digit."
             exit 1
           fi
           {
@@ -336,8 +407,9 @@ jobs:
         run: python3 scripts/build_dist.py --out dist
 
       - name: Deploy preview to Cloudflare Pages
-        # Same project, non-main branch: Cloudflare Pages publishes a preview
-        # URL and leaves the production deployment untouched.
+        # A separate account and project: Pages preview deployments are public
+        # by default, so the result data must be treated as public. Production
+        # remains in its own account and is untouched.
         uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd  # v3.15.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}

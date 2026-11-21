@@ -270,6 +270,10 @@ could be read. See [Publish safety rules](#publish-safety-rules).
 
 ## Environment Variables
 
+These are process environment variables for local runs and for the checker
+steps. The workflow maps the GitHub environment secrets described under
+[Required GitHub configuration](#required-github-configuration) onto them.
+
 - `DOMAIN_CHECK_DELAY_SEC` - Delay between outbound domain lookup requests (default: 0.35)
 - `LK_CHECK_DELAY_SEC` - Delay for .lk API requests (default: 0.8)
 - `LK_CHECK_MAX_RETRIES` - Retry count for .lk API failures (default: 3)
@@ -365,7 +369,7 @@ deployed by hand. The only other workflows are the reusable, secret-free
 |---|---|
 | `pull_request` | `pr-verify.yml` calls the reusable offline checks. A pull request never publishes, needs no secrets, and makes no external probes. |
 | `push` to `main` | `ssl-check.yml` runs the same offline checks, then the certificate checks and a production publish. Only for files that affect the checks, the dashboard or the published bundle. |
-| `push` to `dev`, `develop`, `development` or `development/**` | The same offline checks, then the certificate checks and a preview publish. No other branch, tag or pull request deploys. |
+| `push` to `dev`, `develop`, `development`, `development/*` or `development/*/*` | The same offline checks, then the certificate checks and a preview publish. No other branch, tag or pull request deploys. |
 | `schedule` | Every day at **06:00 Asia/Colombo (UTC+5:30)**, i.e. **00:30 UTC**. |
 | `workflow_dispatch` | Manual run from the GitHub Actions tab. Publishes production from `main` only; it never deploys a preview. |
 
@@ -427,31 +431,49 @@ It does **not** commit the results back to `main`; see
 
 ### What a preview run does
 
-A preview is a real deploy of the checked development branch, kept separate
-from production state:
+A preview is a real deploy of the checked development branch, kept in a
+separate Cloudflare account and a distinct Pages project:
 
 1. Fails closed unless the `certiwatch-preview` environment provides both
-   preview secrets. It never falls back to the production token.
-2. Validates `certiwatch.toml` and runs the SSL and domain checkers.
-3. Builds `dist/` with `scripts/build_dist.py`. No history is restored and
-   `monitor_state.py` is never run, so the bundle has no public history.
-4. Deploys `dist/` to the same Pages project on a preview branch. The production
-   deployment and its hostname are untouched.
+   preview secrets and the required `CERTIWATCH_PREVIEW_PROJECT` variable. It
+   never falls back to the production token, project, or repository secrets.
+2. Refuses to continue when the preview account equals the trusted production
+   account, or the preview project equals the production project.
+3. Validates `certiwatch.toml` and runs the SSL and domain checkers.
+4. Builds `dist/` with `scripts/build_dist.py`. No history is restored and
+   `monitor_state.py` is never run, so the bundle has no alert state.
+5. Deploys `dist/` to the separate preview project on a preview branch.
 
-The preview job never reads or writes the production `history.json`, the KV
-alert checkpoint, or the Discord transport. It has no access to
-`CLOUDFLARE_API_TOKEN`, `CERTIWATCH_STATE_KV_TOKEN` or
-`CERTIWATCH_DISCORD_WEBHOOK`; it only sees the environment-scoped
-`CLOUDFLARE_PREVIEW_*` values.
+The production account and project are untouched. The preview job never reads
+or writes the production `history.json`, the KV alert checkpoint, or the Discord
+transport. It has no access to any `CERTIWATCH_PRODUCTION_*` secret; it only
+sees the environment-scoped `CLOUDFLARE_PREVIEW_*` values.
 
 A preview branch alias is derived from the ref with an allowlist: lowercased,
 `/` and other separators become `-`, only `a-z`, `0-9`, `.`, `_` and `-` survive,
-and the result is capped at 48 characters. For example `development/api` deploys
-as `development-api`, reachable at
-`https://development-api.certiwatch.pages.dev` (or the configured preview
-project). The alias and project are validated before they are interpolated into
-the deploy command, so a branch name or repository variable cannot add command
-arguments.
+the slug is capped at 48 characters, and a deterministic eight-character
+SHA-256 prefix of the **full ref** is appended. The hash prevents collisions
+such as `development/api/v2` and `development/api-v2` mapping to the same
+alias. For example `development/team-feature` deploys as
+`development-team-feature-218ee579`, while `development/team/feature` deploys
+as `development-team-feature-bb8acb47`. A flat `development/api` push deploys
+as `development-api-671f86aa`, reachable at
+`https://development-api-671f86aa.<preview-project>.pages.dev`.
+
+Preview branches are supported to **two levels under `development/`**
+(`development/*` and `development/*/*`). Deeper branches do not trigger the
+workflow, because a GitHub environment branch policy matches one path segment
+per `*` and does not let `**` cross `/`; an unbounded `development/**` trigger
+could not be matched by the environment policy. The alias and project are
+validated before they are interpolated into the deploy command, so a branch
+name or repository variable cannot add command arguments.
+
+**Preview results are public.** Cloudflare Pages preview deployments are
+reachable on the public internet by default, and the bundle contains the same
+public certificate and domain results as production. A preview has no history
+and no alerts, but it must still be treated as a public publishing surface. If
+a preview must be private, put Cloudflare Access in front of it; do not rely on
+an unguessable hostname.
 
 The same path filter as production applies: a preview deploys when a push to a
 development branch changes the checks, configuration, dashboard or bundle
@@ -559,8 +581,9 @@ alert-state namespace and out of any artifact upload.
 Alerting is opt-in twice:
 
 1. `[alerts] discord = true` in `certiwatch.toml`.
-2. `CERTIWATCH_ALERTS_ENABLED` repository variable set to `true` (and the
-   webhook secret configured).
+2. `CERTIWATCH_PRODUCTION_ALERTS_ENABLED` environment variable set to `true`
+   in the `certiwatch-production` environment (and the production webhook
+   secret configured).
 
 `src/monitor_state.py` writes the public history and private pending state
 locally, then writes the pending batch to the remote checkpoint **before** it
@@ -574,8 +597,8 @@ the dashboard publish.
 
 `--transport discord` requires `--checkpoint local` (genuinely persistent host)
 or `--checkpoint kv` (CI). The workflow chooses `kv` only when
-`CERTIWATCH_STATE_KV_NAMESPACE` is configured and refuses to enable alerts
-otherwise. With delivery disabled, pending events are preserved rather than
+`CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE` is configured and refuses to enable
+alerts otherwise. With delivery disabled, pending events are preserved rather than
 discarded; the backlog can grow while alerts are off and is bounded by the 2 MB
 KV state limit. A PUT failure, including a 404, is a checkpoint failure and
 sends nothing; a missing GET key is a first run. Cloudflare limits writes to
@@ -593,56 +616,117 @@ Pages bundle, an Actions cache or an uploaded artifact.
 
 ### Required GitHub configuration
 
-Production uses repository-scoped values under
-**Settings → Secrets and variables → Actions → Repository secrets/variables**:
+Nothing below is applied by this repository. An administrator must configure it
+before enabling previews or merging this change.
+
+#### Repository variables
+
+These are non-secret, trusted settings under
+**Settings → Secrets and variables → Actions → Variables**:
+
+| Name | Required | Description |
+|---|---|---|
+| `CERTIWATCH_PRODUCTION_ACCOUNT_ID` | yes | Production Cloudflare account ID. Used only for consistency and separation checks; it does not replace account isolation. |
+| `CERTIWATCH_PRODUCTION_PAGES_PROJECT` | no | Production Pages project; defaults to `certiwatch`. |
+
+#### `certiwatch-production` environment
+
+Create the environment under **Settings → Environments**. Under
+**Deployment branches and tags**, choose **Selected branches and tags** and
+allow **`main` only**. This binds the production credentials to production, so
+a job on any other ref cannot read them even if the workflow file changes.
 
 | Name | Kind | Description |
 |---|---|---|
-| `CLOUDFLARE_API_TOKEN` | secret | Cloudflare API token with Pages edit permission |
-| `CLOUDFLARE_ACCOUNT_ID` | secret | Cloudflare account ID |
-| `CLOUDFLARE_PAGES_PROJECT` | variable, optional | Pages project name; defaults to `certiwatch` |
-| `CERTIWATCH_STATE_KV_TOKEN` | secret, optional | Separate KV-edit token used only for this namespace; do not reuse the Pages token |
-| `CERTIWATCH_STATE_KV_NAMESPACE` | variable, optional | Dedicated KV namespace id for private alert state |
-| `CERTIWATCH_ALERTS_ENABLED` | variable, optional | Set to `true` to allow Discord delivery; default off |
-| `CERTIWATCH_DISCORD_WEBHOOK` | secret, optional | Discord webhook URL, read by `monitor_state.py` only |
+| `CERTIWATCH_PRODUCTION_PAGES_API_TOKEN` | environment secret | Pages edit token for the production account |
+| `CERTIWATCH_PRODUCTION_PAGES_ACCOUNT_ID` | environment secret | Production account ID; must equal `CERTIWATCH_PRODUCTION_ACCOUNT_ID` |
+| `CERTIWATCH_PRODUCTION_DISCORD_WEBHOOK` | environment secret, optional | Discord webhook URL, read by `monitor_state.py` only |
+| `CERTIWATCH_PRODUCTION_STATE_KV_TOKEN` | environment secret, optional | KV-edit token used only for the alert-state namespace; do not reuse the Pages token |
+| `CERTIWATCH_PRODUCTION_STATE_KV_NAMESPACE` | environment variable, optional | KV namespace id for private alert state |
+| `CERTIWATCH_PRODUCTION_ALERTS_ENABLED` | environment variable, optional | Set to `true` to allow production Discord delivery; default off |
 
 Create the KV namespace and its token manually in Cloudflare; this repository
-never creates or rotates credentials. A separate token limited to **Workers KV
-Storage:Edit** for the account is enough, and the adapter is used only with this
-namespace. The workflow writes the key `certiwatch-alert-state`; it does not
-list or read any other key. If the KV variables are absent, the workflow skips
-both KV steps and runs with `--transport none`.
+never creates or rotates credentials. A token limited to **Workers KV
+Storage:Edit** for the production account is enough. The workflow writes the key
+`certiwatch-alert-state`; it does not list or read any other key. If the KV
+variables are absent, the workflow skips both KV steps and runs with
+`--transport none`.
 
-#### Preview environment
+#### `certiwatch-preview` environment
 
-Create an environment named `certiwatch-preview` under
-**Settings → Environments** and add these to that environment only:
+A Cloudflare API token with Pages edit is **account-scoped**: it can act on any
+Pages project in that account. Project-scoped Pages tokens are not assumed or
+claimed here. The only real isolation boundary is a **separate Cloudflare
+account**, so create one for previews, plus a Pages project in that account
+whose name differs from production.
+
+Create the environment under **Settings → Environments** and add these to that
+environment only:
 
 | Name | Kind | Description |
 |---|---|---|
-| `CLOUDFLARE_PREVIEW_API_TOKEN` | environment secret | Pages edit token used for preview deployments |
-| `CLOUDFLARE_PREVIEW_ACCOUNT_ID` | environment secret | Cloudflare account ID for previews |
-| `CLOUDFLARE_PREVIEW_PROJECT` | environment variable, optional | Pages project for previews; defaults to `certiwatch` |
+| `CLOUDFLARE_PREVIEW_API_TOKEN` | environment secret | Pages edit token for the separate preview account |
+| `CLOUDFLARE_PREVIEW_ACCOUNT_ID` | environment secret | Preview account ID; rejected if it equals the production account |
+| `CERTIWATCH_PREVIEW_PROJECT` | environment variable, **required** | Distinct preview Pages project; there is no default |
 
-Under the environment's **Deployment branches and tags**, choose **Selected
-branches and tags** and allow `dev`, `develop`, `development` and
-`development/*`. That policy means the environment's credentials are released
-only to those branches even if the workflow file is changed elsewhere. Required
-reviewers are optional but recommended for the environment.
+Under **Deployment branches and tags**, choose **Selected branches and tags**
+and allow exactly `dev`, `develop`, `development`, `development/*` and
+`development/*/*`. These are the same patterns as the workflow trigger.
 
-The preview job checks for both preview secrets before it probes or deploys and
-fails if either is missing. It never falls back to the repository-level
-production secrets. Scope the preview token to the Cloudflare account and Pages
-project that should receive previews; a Pages:Edit token used only by this
-environment is enough.
+The two match because GitHub environment rules use Ruby `File.fnmatch`
+semantics: one `*` matches exactly one path segment and never crosses `/`, and
+`**` does not cross `/` either. A single `development/**` rule would therefore
+cover only one level, and a policy with only `development/*` would also fail a
+nested `development/team/feature` push. Listing both depths keeps the policy
+identical to the supported trigger; a deeper branch is outside the supported
+set and does not trigger a job. Required reviewers are optional but
+recommended.
+
+The preview job fails when either secret or the project variable is missing, and
+it refuses a preview that resolves to the production account or project. It
+never reads repository-level production secrets.
+
+#### Migration and removal of old repository secrets
+
+The previous revision read repository-level `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, `CERTIWATCH_STATE_KV_TOKEN`,
+`CERTIWATCH_DISCORD_WEBHOOK`, and the variables `CLOUDFLARE_PAGES_PROJECT`,
+`CERTIWATCH_STATE_KV_NAMESPACE` and `CERTIWATCH_ALERTS_ENABLED`. No workflow in
+this change references those names.
+
+**Delete all of those old repository-level secrets and variables after adding
+the environment-scoped replacements and before enabling previews.** Leaving
+them in place provides no benefit and keeps credentials usable by any workflow
+that names them. Verify the Actions secrets/variables list is empty of the old
+names, then enable the preview environment.
+
+#### Activation gates
+
+Do these in order; none is performed by this repository:
+
+1. Create the `certiwatch-production` environment, bind it to `main`, and add
+   its secrets and variables.
+2. Create the separate Cloudflare account and preview project; create the
+   `certiwatch-preview` environment with its secrets, required project
+   variable, and the branch policy above.
+3. Add the two repository variables.
+4. Delete every old repository-level secret and variable listed above.
+5. Protect `main`: require a pull request, require the PR verification check,
+   and block direct pushes and force-pushes.
+6. Restrict write access to `dev`, `develop`, `development/*` and
+   `development/*/*`. A push to one of those branches runs that branch's code
+   with the preview token, so write access there is equivalent to permission to
+   use the preview credentials.
+7. Only then merge this change and let the first preview run.
 
 Rotate a Pages credential by issuing a new Cloudflare API token with Pages edit
-permission, updating the matching GitHub secret, and revoking the old token.
-Credentials belong only in the GitHub secret store: never commit them, paste
-them into an issue or workflow log, or pass them through a repository variable.
-A token disclosed anywhere else should be revoked and replaced rather than
-reused. No DNS challenge credential is used or needed: deployment goes through
-the Cloudflare Pages API and the workflow never edits DNS records.
+permission in the relevant account, updating the matching environment secret,
+and revoking the old token. Credentials belong only in the GitHub secret store:
+never commit them, paste them into an issue or workflow log, or pass them
+through a variable. A token disclosed anywhere else should be revoked and
+replaced rather than reused. No DNS challenge credential is used or needed:
+deployment goes through the Cloudflare Pages API and the workflow never edits
+DNS records.
 
 All actions are pinned to full commit SHAs: `actions/checkout` v4,
 `actions/setup-python` v5, `actions/setup-node` v4, `actions/cache` v4, and the
@@ -666,8 +750,8 @@ of which happens from this repository. Before the first run, check
 - if the project is already `certiwatch`, no change is needed;
 - if it is still `ssl-domain-monitor` (which serves `ssl-domain-monitor.pages.dev`),
   either rename the project to `certiwatch`, or set the
-  `CLOUDFLARE_PAGES_PROJECT` repository variable to the real project name and
-  update this URL.
+  `CERTIWATCH_PRODUCTION_PAGES_PROJECT` repository variable to the real project
+  name and update this URL.
 
 If neither exists, the first deploy creates the project.
 
@@ -685,7 +769,8 @@ none was `disabled_inactivity` or `disabled_manually`. No workflow was enabled,
 disabled or dispatched while making this change. When this change lands:
 
 1. Review the new `ssl-check.yml` in the Actions tab and confirm the trigger
-   list shows `main`, `dev`, `develop`, `development` and `development/**`.
+   list shows `main`, `dev`, `develop`, `development`, `development/*` and
+   `development/*/*`.
 2. Confirm `Auto Release Notes` disappears from the workflow list after the
    deletion reaches the default branch. If it still appears, it is the stale
    entry for a file that no longer exists; it cannot run.
