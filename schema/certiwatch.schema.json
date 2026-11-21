@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://certiwatch.example/schema/certiwatch.schema.json",
+  "title": "CertiWatch configuration",
+  "description": "The object produced by parsing certiwatch.toml. Unknown keys are rejected so a typo cannot silently disable a check.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "targets"],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Configuration format version."
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ssl_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 443
+        },
+        "thresholds": {
+          "type": "array",
+          "description": "Descending day thresholds used for alert bands: notice, warning, urgent, critical.",
+          "items": {"type": "integer", "minimum": 0},
+          "minItems": 4,
+          "maxItems": 4,
+          "default": [30, 14, 7, 1]
+        },
+        "history_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3650,
+          "default": 365
+        },
+        "check_dns": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run NS/CAA/DNSSEC diagnostics for configured targets."
+        },
+        "check_hsts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Read Strict-Transport-Security for HTTPS targets only."
+        },
+        "check_legacy_tls": {
+          "type": "boolean",
+          "default": false,
+          "description": "Optionally probe TLS 1.0/1.1 capability in addition to the negotiated handshake."
+        }
+      }
+    },
+    "alerts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "discord": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt in to Discord delivery. The webhook URL is read from CERTIWATCH_DISCORD_WEBHOOK and is never stored in this file."
+        }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["domain"],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Host, host:port, or URL. Registration checks normalise away the port and leading www."
+          },
+          "ssl": {
+            "type": "boolean",
+            "default": true
+          },
+          "registration": {
+            "type": "boolean",
+            "default": false,
+            "description": "Opt in to a domain-registration expiry check."
+          },
+          "ssl_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
+            "description": "Per-entry TLS port; overrides defaults.ssl_port."
+          },
+          "tls_mode": {
+            "type": "string",
+            "enum": ["direct", "starttls"],
+            "default": "direct",
+            "description": "direct starts TLS immediately; starttls negotiates it through SMTP, IMAP or POP3."
+          },
+          "starttls_protocol": {
+            "type": "string",
+            "enum": ["smtp", "imap", "pop3"],
+            "description": "Only valid with tls_mode = 'starttls'. Defaults to smtp."
+          },
+          "https": {
+            "type": "boolean",
+            "description": "Whether this endpoint is an HTTPS origin. Defaults to direct TLS on port 443. HSTS is checked only when true."
+          },
+          "dns_name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Domain used for NS/CAA/DNSSEC diagnostics. Defaults to the target name with a leading www. removed."
+          },
+          "check_dns": {
+            "type": "boolean",
+            "description": "Override defaults.check_dns for this target."
+          },
+          "check_hsts": {
+            "type": "boolean",
+            "description": "Override defaults.check_hsts for this target."
+          },
+          "check_legacy_tls": {
+            "type": "boolean",
+            "description": "Override defaults.check_legacy_tls for this target."
+          },
+          "tags": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": true,
+            "default": []
+          },
+          "group": {"type": "string", "minLength": 1},
+          "owner": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Not written to public result or history JSON, but the tracked TOML is public in Git. Do not put secrets here."
+          },
+          "notes": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Not written to public result or history JSON, but the tracked TOML is public in Git. Do not put secrets here."
+          }
+        },
+        "anyOf": [
+          {
+            "required": ["registration"],
+            "properties": {"registration": {"const": true}}
+          },
+          {
+            "not": {
+              "required": ["ssl"],
+              "properties": {"ssl": {"const": false}}
+            }
+          }
+        ]
+      }
+    }
+  }
+}

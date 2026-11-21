@@ -8,22 +8,34 @@ Automatic domain expiration checker.
 - Writes domain_results.json in the same schema used by index.html
 """
 
+import argparse
 import concurrent.futures
 import datetime
 import json
 import os
 import re
 import socket
+import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 try:
     from check_LK_domains import get_expiry_date as get_lk_expiry_date
 except ModuleNotFoundError:
     from .check_LK_domains import get_expiry_date as get_lk_expiry_date
+
+try:
+    from config import CONFIG_FILE, ConfigError, Target, load_config
+    from dns_diagnostics import diagnose_dns
+except ModuleNotFoundError:  # direct ``python3 src/domain/scripts/check_domains.py``
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from config import CONFIG_FILE, ConfigError, Target, load_config
+    from dns_diagnostics import diagnose_dns
 
 DOMAIN_FILE = "domains.conf"
 LEGACY_DOMAIN_FILE = "ssl.conf"
@@ -439,7 +451,7 @@ def lookup_global_domain_whois(domain: str) -> tuple[str, str, str | None]:
     return registrar, "", expiry
 
 
-def check_domain(domain: str) -> dict:
+def _check_domain_registration(domain: str) -> dict:
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     result = {
         "domain": domain,
@@ -452,14 +464,13 @@ def check_domain(domain: str) -> dict:
 
     if domain.endswith(".lk"):
         result["registrar"] = "domains.lk"
-        throttle_request()
+        # The .lk helper applies its own adaptive spacing; throttling here as
+        # well would add a second fixed delay to every lookup.
         lk_value = get_lk_expiry_date(domain, verbose=False)
         expiry_dt = parse_date(lk_value)
         if expiry_dt is None:
-            if "not registered" in lk_value.lower():
-                result["status"] = "unknown"
-            else:
-                result["status"] = "unknown"
+            # No expiry exposed (not registered, API error or unknown domain).
+            result["status"] = "unknown"
             return result
 
         result["expiry_date"] = expiry_dt.strftime("%Y-%m-%d")
@@ -484,30 +495,144 @@ def check_domain(domain: str) -> dict:
     return result
 
 
+def _not_checked_dns(name: str | None) -> dict:
+    return {
+        "checked": False,
+        "name": name,
+        "ns": {"status": "not_checked", "records": [], "error": None},
+        "caa": {"status": "not_checked", "records": [], "error": None},
+        "dnssec": {
+            "status": "not_checked",
+            "validated": False,
+            "records": [],
+            "signature_count": 0,
+            "error": None,
+        },
+        "error": None,
+    }
+
+
+def _attach_dns_diagnostics(result: dict, target: Target | None) -> dict:
+    if target is None:
+        return result
+    dns_name = target.dns_name_value
+    result["dns_name"] = dns_name
+    if not target.check_dns:
+        result["dns"] = _not_checked_dns(dns_name)
+        return result
+    try:
+        result["dns"] = diagnose_dns(dns_name)
+    except Exception as exc:
+        error = str(exc)[:180] or "DNS diagnostics failed"
+        result["dns"] = _not_checked_dns(dns_name)
+        result["dns"].update({"error": error})
+        for record in ("ns", "caa", "dnssec"):
+            result["dns"][record]["status"] = "unknown"
+            result["dns"][record]["error"] = error
+    return result
+
+
+def check_domain(domain: str, *, target: Target | None = None) -> dict:
+    """Check registration expiry, optionally adding configured DNS diagnostics."""
+    return _attach_dns_diagnostics(_check_domain_registration(domain), target)
+
+
 def choose_domain_file() -> str:
     if os.path.exists(DOMAIN_FILE):
         return DOMAIN_FILE
     return LEGACY_DOMAIN_FILE
 
 
-def main() -> None:
-    domain_file = choose_domain_file()
-    print(f"Loading domains from {domain_file}...")
-    domains = load_domains(domain_file)
-    print(f"Found {len(domains)} unique domains. Checking expirations...")
+def write_json_atomic(path: str, payload: dict) -> None:
+    """Write JSON via a sibling temp file + rename.
+
+    A crashed or interrupted run must not leave a truncated result file for
+    the dashboard or the Pages build to consume.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def load_monitor_domains(
+    config_path: str | Path | None = None,
+) -> list[tuple[str, Target]]:
+    """Return ``(registration_domain, target)`` rows from the config."""
+    loaded = load_config(config_path)
+    rows = [(target.registration_domain, target) for target in loaded.registration_targets()]
+    if not rows:
+        raise ConfigError("configuration contains no registration targets")
+    return rows
+
+
+def apply_public_metadata(result: dict, target: Target | None) -> dict:
+    """Attach only tags/group. Owner and notes never enter a result file."""
+    if target is not None:
+        result.update(target.public_metadata())
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Check domain registration expiry for CertiWatch."
+    )
+    parser.add_argument("--config", default=None, help=f"default: ./{CONFIG_FILE}")
+    parser.add_argument("--domains-conf", default=None, help="legacy plain-text input")
+    parser.add_argument("--output", default=OUTPUT_FILE)
+    args = parser.parse_args(argv)
+
+    try:
+        if args.domains_conf is not None:
+            domain_file = args.domains_conf
+            print(f"Loading domains from {domain_file} (legacy)...")
+            entries = [(domain, None) for domain in load_domains(domain_file)]
+        elif args.config is not None or Path(CONFIG_FILE).exists():
+            source = args.config or CONFIG_FILE
+            print(f"Loading targets from {source}...")
+            entries = load_monitor_domains(args.config)
+        else:
+            domain_file = choose_domain_file()
+            print(f"Loading domains from {domain_file} (legacy)...")
+            entries = [(domain, None) for domain in load_domains(domain_file)]
+    except (ConfigError, OSError) as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    if not entries:
+        print("No registration targets configured.", file=sys.stderr)
+        return 1
+
+    print(f"Found {len(entries)} unique domains. Checking expirations...")
 
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_domain = {executor.submit(check_domain, domain): domain for domain in domains}
+        future_to_entry = {
+            executor.submit(check_domain, domain, target=target): (domain, target)
+            for domain, target in entries
+        }
         completed = 0
-        for future in concurrent.futures.as_completed(future_to_domain):
+        for future in concurrent.futures.as_completed(future_to_entry):
+            _, target = future_to_entry[future]
             result = future.result()
+            apply_public_metadata(result, target)
             results.append(result)
             completed += 1
             days = result["days_left"]
             days_text = f"{days}d" if days is not None else "N/A"
             print(
-                f"[{completed:3d}/{len(domains)}] {result['domain']:<45} "
+                f"[{completed:3d}/{len(entries)}] {result['domain']:<45} "
                 f"{result['registrar']:<20} expires: {result['expiry_date']} ({days_text})"
             )
 
@@ -537,15 +662,15 @@ def main() -> None:
         "results": results,
     }
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as handle:
-        json.dump(output, handle, indent=2)
+    write_json_atomic(args.output, output)
 
-    print(f"\nResults saved to {OUTPUT_FILE}")
+    print(f"\nResults saved to {args.output}")
     print(f"  Active:  {output['active']}")
     print(f"  Warning: {output['warning']}")
     print(f"  Urgent:  {output['urgent']}")
     print(f"  Expired: {output['expired']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

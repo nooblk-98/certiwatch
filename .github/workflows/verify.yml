@@ -1,0 +1,53 @@
+name: CertiWatch offline verification
+
+# Reusable, no-secret verification. It is called by the dedicated PR workflow
+# (so PR checks can run even while the production workflow is disabled for
+# inactivity) and by the main publish workflow. It never probes the network,
+# restores history, touches KV or publishes.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Offline checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt pytest
+
+      - name: Validate unified configuration
+        # Offline: only the TOML/schema contract, no DNS or network.
+        run: |
+          test -s certiwatch.toml
+          python3 src/validate_conf.py --config certiwatch.toml --no-dns
+
+      - name: Python tests
+        # Offline: certificates and transports are generated in memory/local
+        # fakes. No history or private state is written.
+        run: python -m pytest -q -p no:cacheprovider
+
+      - name: Dashboard tests
+        run: node --test tests/dashboard.test.mjs
+
+      - name: Publish bundle tests
+        run: python3 scripts/test_build_dist.py

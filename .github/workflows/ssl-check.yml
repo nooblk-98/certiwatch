@@ -1,45 +1,222 @@
-name: SSL Certificate Check
+name: CertiWatch checks
 
 on:
+  # Pull requests use the dedicated, secret-free pr-verify.yml workflow. This
+  # production workflow is main/schedule/manual only.
   push:
-    branches: main
+    branches:
+      - main
+    # Only changes that alter what is checked, rendered or published re-run
+    # the checks and redeploy.
+    paths:
+      - "requirements.txt"
+      - "certiwatch.toml"
+      - "schema/**"
+      - "index.html"
+      - "app.js"
+      - "style.css"
+      - "ssl.conf"
+      - "domains.conf"
+      - "pages/**"
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/ssl-check.yml"
+      - ".github/workflows/verify.yml"
   schedule:
-    # Runs every day at 06:00 Asia/Colombo (UTC+5:30) = 00:30 UTC
+    # Every day at 06:00 Asia/Colombo (UTC+5:30) = 00:30 UTC.
     - cron: "30 0 * * *"
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
+  workflow_dispatch:  # Manual run from the Actions tab.
 
+# The workflow reads the repository and publishes to Cloudflare Pages.
+# It never pushes results back, so the token has no write access.
 permissions:
   contents: read
 
+# One publishing attempt per branch at a time. Superseded pull-request runs are
+# cancelled; a push or scheduled run on main waits instead of being killed
+# mid-publish.
+concurrency:
+  group: certiwatch-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  check-ssl:
-    name: Check SSL Certificates
+  verify:
+    name: Offline checks
+    # Reusable and secret-free, so the dedicated PR workflow can run the same
+    # contract even while this production workflow is disabled.
+    uses: ./.github/workflows/verify.yml
+
+  publish:
+    name: Check certificates and publish
+    # Production only runs after the offline checks pass, from main. Pull
+    # requests and feature-branch dispatches never touch state, history or
+    # Cloudflare.
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify required inputs
+        run: |
+          set -euo pipefail
+          status=0
+          for file in \
+            certiwatch.toml \
+            schema/certiwatch.schema.json \
+            index.html \
+            pages/_headers \
+            scripts/build_dist.py \
+            scripts/build_public_feeds.py \
+            scripts/alert_state_store.py \
+            src/config.py \
+            src/monitor_state.py; do
+            if [ ! -s "$file" ]; then
+              echo "::error file=$file::Required input '$file' is missing or empty."
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Reject symlinked inputs
+        # The builders check this again for every file they copy or read; this
+        # fails earlier and names the repository path.
+        run: |
+          set -euo pipefail
+          status=0
+          for path in \
+            certiwatch.toml \
+            schema \
+            schema/certiwatch.schema.json \
+            index.html \
+            pages \
+            pages/_headers \
+            scripts/build_dist.py \
+            scripts/build_public_feeds.py \
+            scripts/alert_state_store.py \
+            src/config.py \
+            src/monitor_state.py; do
+            if [ -L "$path" ]; then
+              echo "::error file=$path::Input path '$path' is a symlink; refusing to run."
+              status=1
+            fi
+          done
+          exit "$status"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install dependencies
-        run: pip install cryptography
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Validate config files
-        run: python3 src/validate_conf.py --no-dns
+      - name: Restore public history
+        # Public data may use the Actions cache. The key is unique per run so a
+        # new cache is written; restore-keys finds the newest previous one.
+        # Caches unused for 7 days are evicted, and a repository's cache is
+        # capped at 10 GB, so losing history never blocks a publish.
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: history.json
+          key: certiwatch-history-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            certiwatch-history-
+
+      - name: Validate unified configuration
+        run: python3 src/validate_conf.py --config certiwatch.toml --no-dns
 
       - name: Run SSL checker
-        run: python3 src/ssl/scripts/check_ssl.py
+        # Both checkers read certiwatch.toml; the legacy .conf files are not
+        # consulted while the TOML file exists.
+        run: python3 src/ssl/scripts/check_ssl.py --config certiwatch.toml
 
       - name: Run domain expiry checker
-        run: python3 src/domain/scripts/check_domains.py
+        run: python3 src/domain/scripts/check_domains.py --config certiwatch.toml
+
+      - name: Pull private alert state from KV
+        # Private state must not use an Actions cache or artifact in a public
+        # repository. A dedicated, narrowly scoped KV namespace is optional;
+        # without it the CLI never sends and no durable state is claimed.
+        if: vars.CERTIWATCH_STATE_KV_NAMESPACE != ''
+        env:
+          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_STATE_KV_TOKEN }}
+          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_STATE_KV_NAMESPACE }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 scripts/alert_state_store.py pull --out .certiwatch/alert_state.json
+
+      - name: Build public history and private alert state
+        id: monitor
+        env:
+          CERTIWATCH_DISCORD_WEBHOOK: ${{ secrets.CERTIWATCH_DISCORD_WEBHOOK }}
+          CERTIWATCH_ALERTS_ENABLED: ${{ vars.CERTIWATCH_ALERTS_ENABLED }}
+          CERTIWATCH_STATE_KV_TOKEN: ${{ secrets.CERTIWATCH_STATE_KV_TOKEN }}
+          CERTIWATCH_STATE_KV_NAMESPACE: ${{ vars.CERTIWATCH_STATE_KV_NAMESPACE }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          transport=none
+          checkpoint=none
+          if [ -n "${CERTIWATCH_STATE_KV_NAMESPACE:-}" ]; then
+            checkpoint=kv
+          fi
+          if [ "${CERTIWATCH_ALERTS_ENABLED:-false}" = "true" ]; then
+            if [ -z "${CERTIWATCH_DISCORD_WEBHOOK:-}" ]; then
+              echo "::error::CERTIWATCH_ALERTS_ENABLED is true but CERTIWATCH_DISCORD_WEBHOOK is not set."
+              exit 1
+            fi
+            if [ "$checkpoint" != "kv" ]; then
+              echo "::error::Discord alerts require CERTIWATCH_STATE_KV_NAMESPACE for a remote checkpoint."
+              exit 1
+            fi
+            transport=discord
+          fi
+          set +e
+          python3 src/monitor_state.py \
+            --config certiwatch.toml \
+            --ssl-results ssl_results.json \
+            --domain-results domain_results.json \
+            --history history.json \
+            --alert-state .certiwatch/alert_state.json \
+            --transport "$transport" \
+            --checkpoint "$checkpoint"
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::Discord delivery failed; pending events remain in the private state and retry on the next run."
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Save public history cache
+        # Runs even after a delivery warning, so the snapshot is not lost. A
+        # cache outage is a warning, not a publish blocker.
+        if: always() && hashFiles('history.json') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: history.json
+          key: certiwatch-history-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build Pages bundle
+        # Feeds and history join the bundle inside this atomic staging step.
+        # It fails on missing/empty/malformed inputs, symlinks, an all-
+        # unreachable TLS run, a bad history file, or an unmanaged destination.
+        run: python3 scripts/build_dist.py --out dist
 
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd  # v3.15.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy . --project-name=ssl-domain-monitor --branch=main
+          # Project name must match the published hostname (certiwatch.pages.dev).
+          # Override with the CLOUDFLARE_PAGES_PROJECT repository variable if the
+          # Cloudflare account still holds this project under another name.
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT || 'certiwatch' }} --branch=main

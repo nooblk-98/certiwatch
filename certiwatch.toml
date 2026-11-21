@@ -1,0 +1,115 @@
+# CertiWatch unified configuration.
+#
+# Loaded by src/ssl/scripts/check_ssl.py, src/domain/scripts/check_domains.py
+# and src/monitor_state.py. The legacy ssl.conf/domains.conf files remain a
+# local compatibility input only when this file is absent; an invalid TOML
+# file is always an error and never falls back silently.
+#
+# `owner` and `notes` are not copied into ssl_results.json,
+# domain_results.json, history.json, feeds or Discord messages. But this file is
+# tracked in Git: every value here is public. Do not put secrets in owner,
+# notes, tags or group. Only `tags` and `group` are emitted as public metadata.
+
+version = 1
+
+[defaults]
+ssl_port = 443
+thresholds = [30, 14, 7, 1]
+history_limit = 365
+# DNS (NS/CAA/DNSSEC) and HSTS diagnostics are on by default for configured
+# targets. TLS 1.0/1.1 capability probing is optional and off by default.
+check_dns = true
+check_hsts = true
+check_legacy_tls = false
+
+# Per-entry TLS options:
+#   tls_mode = "direct" | "starttls"   (default direct)
+#   starttls_protocol = "smtp" | "imap" | "pop3"
+#   https = true | false               (HSTS is checked only when true)
+#   dns_name = "example.com"           (NS/CAA/DNSSEC name; defaults to host)
+#   check_dns / check_hsts / check_legacy_tls override the defaults above.
+
+[alerts]
+# Opt in to Discord delivery for the monitoring CLI. The webhook URL is read
+# from CERTIWATCH_DISCORD_WEBHOOK and is never stored in this file.
+discord = false
+
+[[targets]]
+domain = "google.com"
+registration = true
+tags = ["global", "core"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Primary search/portal domain."
+
+[[targets]]
+domain = "youtube.com"
+registration = true
+tags = ["global", "media"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Video platform."
+
+[[targets]]
+domain = "facebook.com"
+registration = true
+tags = ["global", "social"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Social platform."
+
+[[targets]]
+domain = "wikipedia.org"
+registration = true
+tags = ["global", "reference"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Reference site."
+
+[[targets]]
+domain = "amazon.com"
+registration = true
+tags = ["global", "commerce"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Commerce platform."
+
+[[targets]]
+domain = "twitter.com"
+registration = true
+tags = ["global", "social"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Social platform."
+
+[[targets]]
+domain = "instagram.com"
+registration = true
+tags = ["global", "social"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Photo platform."
+
+[[targets]]
+domain = "linkedin.com"
+registration = true
+tags = ["global", "social"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Professional network."
+
+[[targets]]
+domain = "reddit.com"
+registration = true
+tags = ["global", "community"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Community platform."
+
+[[targets]]
+domain = "netflix.com"
+registration = true
+tags = ["global", "media"]
+group = "public-web"
+owner = "ops@example.com"
+notes = "Streaming platform."
