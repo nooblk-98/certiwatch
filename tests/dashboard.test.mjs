@@ -29,6 +29,9 @@ test("app.js has no HTML injection sinks and no cache-busting timestamp", () => 
   assert.doesNotMatch(js, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
   assert.doesNotMatch(js, /\?t=[\s\S]{0,40}Date\.now/);
   assert.match(js, /cache:\s*"no-cache"/);
+  assert.match(js, /document\.addEventListener\("visibilitychange"/);
+  assert.match(js, /setInterval\(updateFreshnessViews/);
+  assert.match(js, /FUTURE_SKEW_MS/);
 });
 
 test("style.css follows the system theme and uses system fonts", () => {
@@ -59,6 +62,9 @@ test("staleness uses a 36-hour limit and handles legacy timestamps", () => {
   assert.equal(app.staleness("2026-04-26 01:10 UTC", now).reason, "old");
   assert.equal(app.staleness(null, now).reason, "missing");
   assert.equal(app.staleness("2026-05-02 00:00 UTC", now).reason, "future");
+  assert.equal(app.staleness(new Date(now + 30 * 1000).toISOString(), now).reason, "fresh");
+  assert.equal(app.staleness(new Date(now + 2 * 60 * 1000).toISOString(), now).reason, "future");
+  assert.equal(app.FUTURE_SKEW_MS, 60 * 1000);
 });
 
 test("SSL payload validation accepts good rows and reports skipped ones", () => {
@@ -89,12 +95,15 @@ test("payload validation rejects wrong shapes instead of rendering them", () => 
 });
 
 test("certificate categories match the warning thresholds", () => {
-  assert.equal(app.sslCategory({ status: "valid", days_left: 0 }), "expired");
+  assert.equal(app.sslCategory({ status: "valid", days_left: 0 }), "today");
+  assert.equal(app.sslCategory({ status: "valid", days_left: 0, is_expired: false }), "today");
+  assert.equal(app.sslCategory({ status: "valid", days_left: 0, is_expired: true }), "expired");
   assert.equal(app.sslCategory({ status: "valid", days_left: 1 }), "urgent");
   assert.equal(app.sslCategory({ status: "valid", days_left: 7 }), "urgent");
   assert.equal(app.sslCategory({ status: "valid", days_left: 8 }), "warn");
   assert.equal(app.sslCategory({ status: "valid", days_left: 30 }), "warn");
   assert.equal(app.sslCategory({ status: "valid", days_left: 31 }), "valid");
+  assert.equal(app.sslCategory({ status: "expired", days_left: 0 }), "expired");
   assert.equal(app.sslCategory({ status: "expired", days_left: null }), "expired");
   assert.equal(app.sslCategory({ status: "invalid", days_left: 100 }), "invalid");
   assert.equal(app.sslCategory({ status: "dns_error", days_left: null }), "error");
@@ -109,10 +118,70 @@ test("domain categories follow status and days left", () => {
   assert.equal(app.domainCategory({ status: "unknown", days_left: null }), "unknown");
 });
 
+test("still-valid zero-day certificates read as expires today in every view helper", () => {
+  const todayRow = app.normalizeSslRow({
+    domain: "today.example",
+    status: "valid",
+    days_left: 0,
+    is_expired: false,
+    not_after: "2026-11-21T18:00:00Z"
+  });
+  assert.equal(todayRow.category, "today");
+  assert.equal(todayRow.is_expired, false);
+  assert.equal(todayRow.not_after, "2026-11-21T18:00:00Z");
+  assert.equal(app.expiryDaysText(todayRow), "Expires today");
+  assert.equal(app.expiryStateText(todayRow), "expires today");
+  assert.equal(app.matchesFilter("ssl", todayRow, "soon"), true);
+  assert.equal(app.matchesFilter("ssl", todayRow, "urgent"), true);
+
+  const expiredZero = app.normalizeSslRow({
+    domain: "expired.example", status: "expired", days_left: 0, is_expired: true
+  });
+  assert.equal(expiredZero.category, "expired");
+  assert.equal(app.expiryDaysText(expiredZero), "Expired");
+  assert.equal(app.expiryStateText(expiredZero), "expired");
+});
+
+test("fallback stays a separate result and never changes the configured endpoint", () => {
+  const primary = app.normalizeSslRow({
+    domain: "example.com",
+    status: "timeout",
+    days_left: null,
+    error: "Connection timed out",
+    fallback: {
+      domain: "www.example.com",
+      status: "valid",
+      days_left: 12,
+      provider: "DigiCert",
+      port: 443,
+      is_expired: false,
+      not_after: "2026-12-03T00:00:00Z"
+    }
+  });
+  assert.equal(primary.category, "error");
+  assert.equal(primary.status, "timeout");
+  assert.equal(primary.error, "Connection timed out");
+
+  const fallback = app.sslFallbackRow(primary.raw.fallback);
+  assert.equal(fallback.domain, "www.example.com");
+  assert.equal(fallback.status, "valid");
+  assert.equal(fallback.category, "warn");
+  assert.equal(fallback.port, 443);
+  assert.deepEqual(
+    app.filterAndSort("ssl", [primary], { filter: "all", q: "www.example", sort: "days_asc" }).map((row) => row.domain),
+    ["example.com"]
+  );
+
+  assert.equal(app.sslFallbackRow(null), null);
+  assert.equal(app.sslFallbackRow({ host: "www.example.com", port: 443, status: "valid" }).domain, "www.example.com");
+  assert.equal(app.sslFallbackRow({ host: "www.example.com", port: 8443, status: "valid" }).domain, "www.example.com:8443");
+});
+
 test("filtering, searching and sorting keep one deterministic view", () => {
   const rows = [
     app.normalizeSslRow({ domain: "far.example", status: "valid", days_left: 200, provider: "DigiCert" }),
     app.normalizeSslRow({ domain: "soon.example", status: "valid", days_left: 12, provider: "Let's Encrypt" }),
+    app.normalizeSslRow({ domain: "today.example", status: "valid", days_left: 0, is_expired: false, provider: "DigiCert" }),
     app.normalizeSslRow({ domain: "FaceBook.com", status: "valid", days_left: 3, provider: "DigiCert" }),
     app.normalizeSslRow({ domain: "broken.example", status: "timeout", days_left: null, error: "Connection timed out" }),
     app.normalizeSslRow({ domain: "gone.example", status: "expired", days_left: -2 })
@@ -120,7 +189,11 @@ test("filtering, searching and sorting keep one deterministic view", () => {
 
   assert.deepEqual(
     app.filterAndSort("ssl", rows, { filter: "soon", q: "", sort: "days_asc" }).map((row) => row.domain),
-    ["FaceBook.com", "soon.example"]
+    ["today.example", "FaceBook.com", "soon.example"]
+  );
+  assert.deepEqual(
+    app.filterAndSort("ssl", rows, { filter: "urgent", q: "", sort: "days_asc" }).map((row) => row.domain),
+    ["today.example", "FaceBook.com"]
   );
   assert.deepEqual(
     app.filterAndSort("ssl", rows, { filter: "all", q: "FACE", sort: "days_asc" }).map((row) => row.domain),
@@ -132,13 +205,13 @@ test("filtering, searching and sorting keep one deterministic view", () => {
   );
   assert.deepEqual(
     app.filterAndSort("ssl", rows, { filter: "all", q: "", sort: "domain_asc" }).map((row) => row.domain),
-    ["broken.example", "FaceBook.com", "far.example", "gone.example", "soon.example"]
+    ["broken.example", "FaceBook.com", "far.example", "gone.example", "soon.example", "today.example"]
   );
   assert.deepEqual(
     app.filterAndSort("ssl", rows, { filter: "all", q: "", sort: "days_asc" }).map((row) => row.domain),
-    ["broken.example", "gone.example", "FaceBook.com", "soon.example", "far.example"]
+    ["broken.example", "gone.example", "today.example", "FaceBook.com", "soon.example", "far.example"]
   );
-  assert.equal(app.matchesFilter("ssl", rows[3], "soon"), false);
+  assert.equal(app.matchesFilter("ssl", rows[4], "soon"), false);
 });
 
 test("CSV output quotes fields and blocks spreadsheet formulas", () => {

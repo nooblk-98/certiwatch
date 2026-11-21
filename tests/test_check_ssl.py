@@ -33,6 +33,7 @@ NEW_RESULT_FIELDS = {
     "host",
     "port",
     "resolved_via",
+    "fallback",
     "trusted_chain",
     "chain_error",
     "hostname_matches",
@@ -45,6 +46,7 @@ NEW_RESULT_FIELDS = {
     "key_curve",
     "not_before",
     "not_after",
+    "is_expired",
     "fingerprint_sha256",
     "serial_number",
     "tls_version",
@@ -160,6 +162,7 @@ def test_certificate_metadata_reports_san_wildcard_key_and_fingerprint(rsa_key):
     assert metadata["san"] == ["example.com", "*.example.com"]
     assert metadata["san_count"] == 2
     assert metadata["wildcard"] is True
+    assert metadata["is_expired"] is False
     assert metadata["hostname_matches"] is True
     assert metadata["key_type"] == "RSA"
     assert metadata["key_size"] == 2048
@@ -188,17 +191,26 @@ def test_certificate_metadata_reports_ec_curve(ec_key):
         ("a.b.example.com", ["*.example.com"], [], False),
         ("example.com", ["*.example.com"], [], False),
         ("example.com", ["other.com"], [], False),
+        ("example.com", ["*.com"], [], False),
+        ("example.co.uk", ["*.co.uk"], [], True),
+        ("a.example.co.uk", ["*.co.uk"], [], False),
+        ("a.b.example.co.uk", ["*.co.uk"], [], False),
+        ("example.com", ["*.example.com."], [], False),
         ("127.0.0.1", [], ["127.0.0.1"], True),
         ("127.0.0.2", [], ["127.0.0.1"], False),
     ],
 )
 def test_hostname_matches(host, dns_names, ip_addresses, expected):
-    assert cs.hostname_matches(host, dns_names, ip_addresses, None) is expected
+    assert cs.hostname_matches(host, dns_names, ip_addresses) is expected
 
 
-def test_hostname_falls_back_to_common_name_only_without_san():
-    assert cs.hostname_matches("example.com", [], [], "example.com") is True
-    assert cs.hostname_matches("other.com", [], [], "example.com") is False
+def test_hostname_ignores_common_name_when_certificate_has_no_san():
+    # CN-only certificates must not satisfy hostname matching (review finding).
+    assert cs.hostname_matches("example.com", [], []) is False
+
+
+def test_hostname_ignores_common_name_even_when_san_is_present_but_different():
+    assert cs.hostname_matches("example.com", ["other.com"], []) is False
 
 
 # ── Status derivation ─────────────────────────────────────────────────────────
@@ -208,28 +220,34 @@ def test_hostname_falls_back_to_common_name_only_without_san():
     "kwargs, status, error",
     [
         (
-            dict(days_left=30, trusted_chain=True, host_matches=True, verification_error=None, self_signed=False),
+            dict(days_left=30, is_expired=False, trusted_chain=True, host_matches=True, verification_error=None, self_signed=False),
             "valid",
             None,
         ),
         (
-            dict(days_left=0, trusted_chain=False, host_matches=True, verification_error="expired", self_signed=False),
+            dict(days_left=0, is_expired=False, trusted_chain=True, host_matches=True, verification_error=None, self_signed=False),
+            "valid",
+            None,
+        ),
+        (
+            dict(days_left=0, is_expired=True, trusted_chain=False, host_matches=True, verification_error="expired", self_signed=False),
             "expired",
             "Certificate has expired",
         ),
         (
-            dict(days_left=30, trusted_chain=False, host_matches=False, verification_error="mismatch", self_signed=False),
+            dict(days_left=30, is_expired=False, trusted_chain=False, host_matches=False, verification_error="mismatch", self_signed=False),
             "invalid",
             "Hostname mismatch",
         ),
         (
-            dict(days_left=30, trusted_chain=False, host_matches=True, verification_error=None, self_signed=True),
+            dict(days_left=30, is_expired=False, trusted_chain=False, host_matches=True, verification_error=None, self_signed=True),
             "invalid",
             "Self-signed certificate",
         ),
         (
             dict(
                 days_left=30,
+                is_expired=False,
                 trusted_chain=False,
                 host_matches=True,
                 verification_error="unable to get local issuer certificate",
@@ -239,7 +257,7 @@ def test_hostname_falls_back_to_common_name_only_without_san():
             "Certificate verification failed: unable to get local issuer certificate",
         ),
         (
-            dict(days_left=30, trusted_chain=False, host_matches=True, verification_error=None, self_signed=False),
+            dict(days_left=30, is_expired=False, trusted_chain=False, host_matches=True, verification_error=None, self_signed=False),
             "invalid",
             "Certificate chain is not trusted",
         ),
@@ -342,31 +360,182 @@ def test_check_ssl_hostname_mismatch_is_reported_not_hidden(tls_server, ca_bundl
     assert result["error"] == "Hostname mismatch"
 
 
-def test_www_fallback_uses_resolved_via_and_keeps_error_empty(monkeypatch, rsa_key):
-    cert = build_cert(common_name="www.example.com", key=rsa_key, sans=dns_san("www.example.com"))
+def _probe_for(rsa_key, hostname: str) -> cs.TLSProbe:
+    cert = build_cert(common_name=hostname, key=rsa_key, sans=dns_san(hostname))
     der = cert.public_bytes(serialization.Encoding.DER)
+    return cs.TLSProbe(
+        der=der,
+        tls_version="TLSv1.3",
+        cipher="TLS_AES_256_GCM_SHA384",
+        trusted=True,
+        chain_der=[der],
+        chain_source="verified",
+    )
 
+
+def test_cn_only_certificate_is_not_a_hostname_match(tls_server, ca_bundle, monkeypatch, rsa_key):
+    root_key = rsa_key
+    root = build_cert(
+        common_name="CertiWatch Test Root",
+        key=root_key,
+        is_ca=True,
+        organization="CertiWatch Test CA",
+    )
+    leaf_key = rsa_module.generate_private_key(public_exponent=65537, key_size=2048)
+    # CN names the host, but there is no SAN extension at all.
+    leaf = build_cert(
+        common_name="127.0.0.1",
+        key=leaf_key,
+        issuer_cert=root,
+        issuer_key=root_key,
+    )
+    monkeypatch.setattr(cs, "CA_FILE", ca_bundle(root))
+    server = tls_server(leaf, leaf_key)
+
+    result = cs.check_ssl(server.endpoint)
+
+    assert result["trusted_chain"] is True
+    assert result["san"] == []
+    assert result["hostname_matches"] is False
+    assert result["status"] == "invalid"
+    assert result["error"] == "Hostname mismatch"
+
+
+def test_timeout_keeps_original_row_and_attaches_www_fallback(monkeypatch, rsa_key):
     def fake_probe(host: str, port: int):
         if host == "example.com":
             raise socket.timeout("timed out")
-        return cs.TLSProbe(
-            der=der,
-            tls_version="TLSv1.3",
-            cipher="TLS_AES_256_GCM_SHA384",
-            trusted=True,
-            chain_der=[der],
-            chain_source="verified",
-        )
+        return _probe_for(rsa_key, host)
 
     monkeypatch.setattr(cs, "probe_endpoint", fake_probe)
 
     result = cs.check_ssl("example.com")
 
+    # The configured host keeps its real failure; the fallback never wins.
+    assert result["status"] == "timeout"
+    assert result["error"] == "Connection timed out"
+    assert result["resolved_via"] is None
+    assert result["trusted_chain"] is None
+    assert result["days_left"] is None
+    assert result["expires_on"] == "N/A"
+
+    fallback = result["fallback"]
+    assert fallback["domain"] == "www.example.com"
+    assert fallback["resolved_via"] == "www.example.com"
+    assert fallback["status"] == "valid"
+    assert fallback["hostname_matches"] is True
+
+
+def test_dns_error_keeps_original_row_and_attaches_www_fallback(monkeypatch, rsa_key):
+    def fake_probe(host: str, port: int):
+        if host == "example.com":
+            raise socket.gaierror(-2, "Name or service not known")
+        return _probe_for(rsa_key, host)
+
+    monkeypatch.setattr(cs, "probe_endpoint", fake_probe)
+
+    result = cs.check_ssl("example.com")
+
+    assert result["status"] == "dns_error"
+    assert result["error"].startswith("DNS error:")
+    assert result["fallback"]["domain"] == "www.example.com"
+    assert result["fallback"]["resolved_via"] == "www.example.com"
+
+
+def test_fallback_is_not_used_off_port_443(monkeypatch):
+    probed: list[str] = []
+
+    def fake_probe(host: str, port: int):
+        probed.append(host)
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(cs, "probe_endpoint", fake_probe)
+
+    result = cs.check_ssl("mail.example.com:993")
+
+    assert probed == ["mail.example.com"]
+    assert result["status"] == "timeout"
+    assert result["error"] == "Connection timed out"
+    assert result["fallback"] is None
+
+
+def test_failed_fallback_leaves_no_object(monkeypatch):
+    def fake_probe(host: str, port: int):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(cs, "probe_endpoint", fake_probe)
+
+    result = cs.check_ssl("example.com")
+
+    assert result["status"] == "timeout"
+    assert result["error"] == "Connection timed out"
+    assert result["fallback"] is None
+
+
+def test_www_prefixed_host_does_not_double_prefix_fallback(monkeypatch):
+    probed: list[str] = []
+
+    def fake_probe(host: str, port: int):
+        probed.append(host)
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(cs, "probe_endpoint", fake_probe)
+
+    result = cs.check_ssl("www.example.com")
+
+    assert probed == ["www.example.com"]
+    assert result["status"] == "timeout"
+    assert result["fallback"] is None
+
+
+def test_certificate_with_hours_left_reports_valid_with_zero_days(tls_server, ca_bundle, monkeypatch, rsa_key):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    root_key = rsa_key
+    root = build_cert(
+        common_name="CertiWatch Test Root",
+        key=root_key,
+        is_ca=True,
+        organization="CertiWatch Test CA",
+    )
+    leaf_key = rsa_module.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf = build_cert(
+        common_name="127.0.0.1",
+        key=leaf_key,
+        sans=ip_san("127.0.0.1"),
+        issuer_cert=root,
+        issuer_key=root_key,
+        not_before=now - datetime.timedelta(hours=1),
+        not_after=now + datetime.timedelta(minutes=30),
+    )
+    monkeypatch.setattr(cs, "CA_FILE", ca_bundle(root))
+    server = tls_server(leaf, leaf_key)
+
+    result = cs.check_ssl(server.endpoint)
+
+    # Floored display stays 0, but the exact timestamp makes it valid.
+    assert result["days_left"] == 0
+    assert result["is_expired"] is False
     assert result["status"] == "valid"
-    assert result["resolved_via"] == "www.example.com"
     assert result["error"] is None
-    assert result["domain"] == "example.com"
-    assert result["host"] == "example.com"
+
+
+def test_certificate_past_not_after_reports_expired(tls_server, rsa_key):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = build_cert(
+        common_name="127.0.0.1",
+        key=rsa_key,
+        sans=ip_san("127.0.0.1"),
+        not_before=now - datetime.timedelta(days=2),
+        not_after=now - datetime.timedelta(hours=1),
+    )
+    server = tls_server(cert, rsa_key)
+
+    result = cs.check_ssl(server.endpoint)
+
+    assert result["is_expired"] is True
+    assert result["status"] == "expired"
+    assert result["error"] == "Certificate has expired"
+    assert result["days_left"] < 0
 
 
 def test_invalid_entry_returns_error_result():

@@ -13,6 +13,8 @@ ENV/
 build/
 dist/
 dist.staging/
+/.dist.staging-*/
+/.dist.previous-*/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/

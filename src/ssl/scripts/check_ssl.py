@@ -5,15 +5,22 @@ SSL certificate checker.
 Reads targets from ssl.conf, connects over TLS and reports:
 
 - Provider/issuer (Let's Encrypt, Cloudflare, Google Trust Services, etc.)
-- Issue date, expiry date, days remaining and status
-- Whether the presented chain validates against the system trust store
-- Subject Alternative Names, wildcard and hostname-match metadata
+- Issue date and expiry: ``days_left`` is floored for display, while status
+  uses the exact ``not_after`` timestamp (``is_expired``)
+- Whether the presented chain validates against the configured trust store
+- DNS/IP SAN coverage (subject CN is not used for hostname matching), wildcard
+  metadata, including rejection of wildcards under a single-label suffix
 - Leaf key type/size/curve and SHA-256 fingerprint
 - Negotiated TLS version and cipher
 - The certificate chain as presented by the server
 
 Entries may be ``host`` or ``host:port`` (default port 443), so mail and
 other TLS services can be monitored as well as HTTPS.
+
+If the configured host is unreachable on port 443 because of DNS or a timeout,
+the original row keeps that status and error. A separate ``fallback`` object
+may carry a full TLS result for ``www.<host>``; it never changes the original
+validity. Other ports do not use a fallback.
 
 Revocation (OCSP/CRL) is **not** checked. The result records
 ``revocation_checked: false`` rather than claiming a revocation status.
@@ -222,7 +229,12 @@ def _subject_alt_names(cert: x509.Certificate) -> tuple[list[str], list[str]]:
 
 
 def _dnsname_match(pattern: str, host: str) -> bool:
-    """RFC 6125-style match: a wildcard covers exactly one leftmost label."""
+    """RFC 6125-style match: a wildcard covers exactly one leftmost label.
+
+    A wildcard suffix must contain at least two labels: ``*.example.com`` is
+    accepted, ``*.com`` and ``*.uk`` are rejected rather than treated as a
+    match for every name under a public suffix.
+    """
     pattern = pattern.lower().rstrip(".")
     host = host.lower().rstrip(".")
     if pattern == host:
@@ -230,7 +242,8 @@ def _dnsname_match(pattern: str, host: str) -> bool:
     if not pattern.startswith("*."):
         return False
     suffix = pattern[2:]
-    if not suffix or "*" in suffix:
+    suffix_labels = suffix.split(".")
+    if len(suffix_labels) < 2 or any(not label for label in suffix_labels):
         return False
     if not host.endswith("." + suffix):
         return False
@@ -238,11 +251,13 @@ def _dnsname_match(pattern: str, host: str) -> bool:
     return bool(prefix) and "." not in prefix
 
 
-def hostname_matches(host: str, dns_names: list[str], ip_addresses: list[str], common_name: str | None) -> bool:
-    """Check a host or IP literal against the certificate's names.
+def hostname_matches(host: str, dns_names: list[str], ip_addresses: list[str]) -> bool:
+    """Check a host or IP literal against the certificate's SAN entries only.
 
-    SAN entries take precedence; the subject CN is only consulted when the
-    certificate has no DNS SAN at all, which is the modern client rule.
+    The subject common name is deliberately not consulted. RFC 6125 and the
+    CA/Browser Forum baseline requirements treat SAN as authoritative, and a
+    CN-only certificate must report ``hostname_matches: false`` so a mismatch
+    cannot be hidden by a legacy name.
     """
     host = host.strip().lower().rstrip(".")
     try:
@@ -259,10 +274,7 @@ def hostname_matches(host: str, dns_names: list[str], ip_addresses: list[str], c
                 continue
         return False
 
-    candidates = list(dns_names)
-    if not candidates and common_name:
-        candidates = [common_name]
-    return any(_dnsname_match(pattern, host) for pattern in candidates)
+    return any(_dnsname_match(pattern, host) for pattern in dns_names)
 
 
 def _key_metadata(cert: x509.Certificate) -> tuple[str | None, int | None, str | None]:
@@ -292,7 +304,11 @@ def certificate_metadata(
     subject_cn = _name_fields(cert.subject).get("commonName")
     not_before = _not_before(cert)
     not_after = _not_after(cert)
+    # days_left stays a floor for display. Expiry itself is decided by the
+    # exact timestamp in is_expired, so a certificate with 12 hours left can
+    # show 0 days and still be valid.
     days_left = (not_after - now).days
+    is_expired = now >= not_after
     key_type, key_size, key_curve = _key_metadata(cert)
 
     all_names = dns_names + ip_addresses
@@ -304,6 +320,7 @@ def certificate_metadata(
         "issued_on": not_before.strftime("%Y-%m-%d"),
         "expires_on": not_after.strftime("%Y-%m-%d"),
         "days_left": days_left,
+        "is_expired": is_expired,
         "provider": detect_provider(issuer_fields),
         "not_before": _iso_z(not_before),
         "not_after": _iso_z(not_after),
@@ -311,7 +328,7 @@ def certificate_metadata(
         "san": all_names,
         "san_count": len(all_names),
         "wildcard": wildcard,
-        "hostname_matches": hostname_matches(host, dns_names, ip_addresses, subject_cn),
+        "hostname_matches": hostname_matches(host, dns_names, ip_addresses),
         "key_type": key_type,
         "key_size": key_size,
         "key_curve": key_curve,
@@ -367,11 +384,18 @@ class TLSProbe:
 
 
 def _client_context(verify: bool) -> ssl.SSLContext:
+    """Build the context used for a probe handshake.
+
+    Trust for ``trusted_chain`` comes from ``ssl.create_default_context()``:
+    the interpreter/OpenSSL default trust store (honouring ``SSL_CERT_FILE``
+    and ``SSL_CERT_DIR``) or the bundle named by ``SSL_CA_FILE``. Hostname
+    checking is disabled on that context because the chain probe reports
+    trust only; ``hostname_matches()`` evaluates DNS/IP SAN coverage from the
+    leaf separately. A private CA therefore has to be added to the configured
+    trust store before ``trusted_chain`` can become true.
+    """
     if verify:
         context = ssl.create_default_context(cafile=CA_FILE)
-        # Chain trust and name matching are reported separately: the chain
-        # probe validates the signature/validity path only, and
-        # hostname_matches() evaluates SAN coverage on its own.
         context.check_hostname = False
         return context
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -471,6 +495,7 @@ def _self_signed(chain: list[dict]) -> bool:
 def derive_status(
     *,
     days_left: int | None,
+    is_expired: bool,
     trusted_chain: bool,
     host_matches: bool | None,
     verification_error: str | None,
@@ -478,12 +503,14 @@ def derive_status(
 ) -> tuple[str, str | None]:
     """Map probe facts to the legacy status/error pair.
 
-    ``error`` keeps a human summary; the untouched verification text lives in
-    ``chain_error`` so a real CA/name problem is never reduced to "invalid".
+    Expiry uses the exact ``not_after`` timestamp (``is_expired``), not the
+    floored ``days_left`` display value. ``error`` keeps a human summary; the
+    untouched verification text lives in ``chain_error`` so a real CA/name
+    problem is never reduced to "invalid".
     """
     if days_left is None:
         return "invalid", "Certificate has no readable expiry date"
-    if days_left <= 0:
+    if is_expired:
         return "expired", "Certificate has expired"
     if host_matches is False:
         return "invalid", "Hostname mismatch"
@@ -506,9 +533,11 @@ def _base_result(domain: str, host: str, port: int) -> dict:
         "issued_on": "N/A",
         "expires_on": "N/A",
         "days_left": None,
+        "is_expired": None,
         "error": None,
         "checked_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "resolved_via": None,
+        "fallback": None,
         "trusted_chain": None,
         "chain_error": None,
         "hostname_matches": None,
@@ -559,6 +588,7 @@ def _apply_probe(result: dict, probe: TLSProbe, match_host: str, now: datetime.d
     self_signed = _self_signed(chain)
     status, error = derive_status(
         days_left=metadata["days_left"],
+        is_expired=metadata["is_expired"],
         trusted_chain=probe.trusted,
         host_matches=metadata["hostname_matches"],
         verification_error=probe.verification_error,
@@ -572,6 +602,29 @@ def _check_target(host: str, port: int, result: dict) -> dict:
     probe = probe_endpoint(host, port)
     _apply_probe(result, probe, match_host=host)
     return result
+
+
+def _attach_www_fallback(result: dict, host: str, port: int) -> None:
+    """Record an optional ``www.`` probe without changing the original row.
+
+    The configured host keeps its DNS/timeout status and error. Only on port
+    443, and only when the host is not already ``www.``-prefixed, a complete
+    second TLS result is stored in ``fallback`` with its own ``domain`` and
+    ``resolved_via``. The fallback never contributes to the original row's
+    validity or status; consumers must opt in to it.
+    """
+    if port != DEFAULT_PORT or host.startswith("www."):
+        return
+
+    fallback_host = f"www.{host}"
+    fallback = _base_result(format_endpoint(fallback_host, port), fallback_host, port)
+    try:
+        _check_target(fallback_host, port, fallback)
+    except Exception:
+        # A failed fallback leaves no object; the original error stands alone.
+        return
+    fallback["resolved_via"] = format_endpoint(fallback_host, port)
+    result["fallback"] = fallback
 
 
 def check_ssl(domain: str) -> dict:
@@ -608,30 +661,14 @@ def check_ssl(domain: str) -> dict:
         result["error"] = f"SSL error: {_trim(str(exc), 120)}"
 
     except (socket.timeout, TimeoutError):
-        if not host.startswith("www."):
-            www_host = f"www.{host}"
-            try:
-                resolved = _check_target(www_host, port, result)
-            except Exception:
-                pass
-            else:
-                resolved["resolved_via"] = format_endpoint(www_host, port)
-                return resolved
         result["status"] = "timeout"
         result["error"] = "Connection timed out"
+        _attach_www_fallback(result, host, port)
 
     except socket.gaierror as exc:
-        if not host.startswith("www."):
-            www_host = f"www.{host}"
-            try:
-                resolved = _check_target(www_host, port, result)
-            except Exception:
-                pass
-            else:
-                resolved["resolved_via"] = format_endpoint(www_host, port)
-                return resolved
         result["status"] = "dns_error"
         result["error"] = f"DNS error: {_trim(str(exc), 120)}"
+        _attach_www_fallback(result, host, port)
 
     except ConnectionRefusedError:
         result["status"] = "no_https"

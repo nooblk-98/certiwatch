@@ -12,20 +12,36 @@ Required inputs (build fails without them):
     pages/_headers       cache policy, published as _headers
 
 Optional inputs, copied only when present:
-    app.js               dashboard script, once it is split out of index.html
-    style.css            dashboard stylesheet, once it is split out of index.html
+    app.js               dashboard script, split out of index.html
+    style.css            dashboard stylesheet, split out of index.html
 
 Adding a file to the published site is therefore a reviewed change to this
 list, not a side effect of the repository growing.
 
+Safety rules enforced here:
+
+* Inputs must be regular files. A symlink is rejected, including one used as a
+  parent directory (``pages`` pointing elsewhere), so the bundle can never pick
+  up a file from outside the checkout.
+* The output directory may live outside the source tree. Inside the source tree
+  only the designated ``dist`` directory is allowed, and a non-empty
+  destination is only replaced when every entry in it is a file this builder
+  itself can produce. Anything else is refused instead of deleted.
+* A run whose SSL rows *all* failed before a certificate was read (DNS, connect,
+  TLS handshake or entry errors) is not a monitoring result: it is a runner
+  without egress or a network outage. Publishing it would replace real data
+  with "everything is broken", so the build fails and leaves production alone.
+  Genuine certificate verdicts - ``valid``, ``expired``, ``invalid`` - always
+  publish, even when most rows are failures.
+
 Usage:
     python3 scripts/build_dist.py                # build ./dist
-    python3 scripts/build_dist.py --out build/pages --source .
+    python3 scripts/build_dist.py --out dist --source .
 
 Exit codes:
     0  bundle built and verified
     1  required input missing, empty or malformed
-    2  unsafe output path or unexpected bundle contents
+    2  unsafe input or output path, or unexpected bundle contents
 """
 
 from __future__ import annotations
@@ -35,7 +51,9 @@ import hashlib
 import json
 import shutil
 import sys
-from pathlib import Path
+import tempfile
+from collections import Counter
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -52,14 +70,59 @@ OPTIONAL_FILES = {
     "style.css": "style.css",
 }
 
+# Every name a previous bundle of ours can contain.
+BUNDLE_NAMES = frozenset(REQUIRED_FILES.values()) | frozenset(OPTIONAL_FILES.values())
+
+# The only directory the builder may write inside the source tree.
+DESIGNATED_OUTPUT = "dist"
+
 # Result files must be real check output, not an empty placeholder.
 JSON_FILES = ("ssl_results.json", "domain_results.json")
+
+# Only these statuses prove a certificate was actually read and judged. Anything
+# else - DNS/connect/handshake failures, input errors, a missing or unknown
+# status - is treated as "not observed", so a future checker status can never
+# silently weaken the gate. See the module docstring.
+OBSERVED_SSL_STATUSES = frozenset({"valid", "expired", "invalid"})
 
 
 class BuildError(Exception):
     def __init__(self, message: str, code: int = 1) -> None:
         super().__init__(message)
         self.code = code
+
+
+def reject_symlinked_path(source: Path, rel: str) -> None:
+    """Reject a symlink at the file itself or at any parent component."""
+    current = source
+    for index, part in enumerate(PurePosixPath(rel).parts):
+        current = current / part
+        if current.is_symlink():
+            where = PurePosixPath(rel).parts[: index + 1]
+            raise BuildError(
+                f"input {rel!r} is a symlink (at {'/'.join(where)!r}); refusing to publish it",
+                code=2,
+            )
+
+
+def validate_ssl_coverage(results: list) -> None:
+    """Refuse a run where no certificate was read at all."""
+    observed = sum(
+        1 for row in results if isinstance(row, dict) and row.get("status") in OBSERVED_SSL_STATUSES
+    )
+    if observed:
+        return
+
+    counts = Counter(
+        row.get("status", "<missing>") if isinstance(row, dict) else "<not-an-object>"
+        for row in results
+    )
+    summary = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
+    raise BuildError(
+        f"ssl_results.json: all {len(results)} rows are connection/DNS failures "
+        f"({summary}); no certificate was read, so this run must not replace the "
+        "published results"
+    )
 
 
 def validate_result_json(path: Path) -> None:
@@ -84,17 +147,23 @@ def validate_result_json(path: Path) -> None:
             f"{path.name}: 'results' is empty, refusing to publish an empty dashboard"
         )
 
+    if path.name == "ssl_results.json":
+        validate_ssl_coverage(results)
+
 
 def plan_bundle(source: Path) -> dict[str, str]:
     """Return source-relative path -> bundle path for this build."""
-    missing = [
-        rel
-        for rel in REQUIRED_FILES
-        if not (source / rel).is_file() or (source / rel).stat().st_size == 0
-    ]
+    missing: list[str] = []
+    for rel in REQUIRED_FILES:
+        reject_symlinked_path(source, rel)
+        path = source / rel
+        if not path.is_file() or path.stat().st_size == 0:
+            missing.append(rel)
     if missing:
-        listed = ", ".join(missing)
-        raise BuildError(f"required input missing or empty: {listed}")
+        raise BuildError(f"required input missing or empty: {', '.join(missing)}")
+
+    for rel in OPTIONAL_FILES:
+        reject_symlinked_path(source, rel)
 
     for name in JSON_FILES:
         validate_result_json(source / name)
@@ -107,12 +176,48 @@ def plan_bundle(source: Path) -> dict[str, str]:
 
 
 def check_out_path(source: Path, out: Path) -> None:
+    """Refuse destructive output locations."""
     source_r = source.resolve()
     out_r = out.resolve()
     if out_r == source_r:
         raise BuildError(f"refusing to use the source tree as output: {out_r}", code=2)
     if out_r in source_r.parents:
         raise BuildError(f"refusing to replace a parent of the source tree: {out_r}", code=2)
+    if source_r in out_r.parents:
+        rel = out_r.relative_to(source_r)
+        if rel.parts != (DESIGNATED_OUTPUT,):
+            raise BuildError(
+                f"refusing to write inside the source tree at {rel.as_posix()!r}; "
+                f"the only allowed in-tree output is {DESIGNATED_OUTPUT!r}",
+                code=2,
+            )
+
+
+def check_existing_bundle(out: Path) -> None:
+    """Refuse to delete a non-empty directory we did not create."""
+    if not out.exists():
+        return
+    if out.is_symlink() or not out.is_dir():
+        raise BuildError(f"refusing to replace output path {out}: not a plain directory", code=2)
+
+    for entry in out.rglob("*"):
+        rel = entry.relative_to(out).as_posix()
+        if entry.is_symlink() or not entry.is_file() or "/" in rel or rel not in BUNDLE_NAMES:
+            raise BuildError(
+                f"refusing to replace {out}: it is not a previous CertiWatch bundle "
+                f"(found {rel!r})",
+                code=2,
+            )
+
+    # A bundle we produced always contains _headers, so a directory without it
+    # is somebody else's data even if every file name happens to match.
+    names = {p.name for p in out.rglob("*") if p.is_file()}
+    if names and "_headers" not in names:
+        raise BuildError(
+            f"refusing to replace {out}: it has no _headers, so it is not a "
+            "previous CertiWatch bundle",
+            code=2,
+        )
 
 
 def sha256(path: Path) -> str:
@@ -123,36 +228,56 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def publish(staging: Path, out: Path) -> None:
+    """Swap a finished staging directory into place, keeping the old bundle."""
+    if not out.exists():
+        staging.rename(out)
+        return
+
+    backup = Path(tempfile.mkdtemp(prefix=f".{out.name}.previous-", dir=out.parent))
+    backup.rmdir()
+    out.rename(backup)
+    try:
+        staging.rename(out)
+    except OSError:
+        backup.rename(out)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
+
+
 def build(source: Path, out: Path) -> list[str]:
+    source = source.resolve()
     plan = plan_bundle(source)
     check_out_path(source, out)
-
-    # Build in a sibling staging directory so a failed build never leaves a
-    # half-filled dist/ behind for a deploy step to publish.
-    staging = out.with_name(out.name + ".staging")
-    for path in (staging,):
-        if path.exists():
-            shutil.rmtree(path)
-    staging.mkdir(parents=True)
-
-    for rel, dest in plan.items():
-        target = staging / dest
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source / rel, target)
-
-    produced = sorted(p.relative_to(staging).as_posix() for p in staging.rglob("*") if p.is_file())
     expected = sorted(plan.values())
-    if produced != expected:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise BuildError(
-            f"bundle contents differ from the allowlist: unexpected={sorted(set(produced) - set(expected))} "
-            f"missing={sorted(set(expected) - set(produced))}",
-            code=2,
-        )
 
-    if out.exists():
-        shutil.rmtree(out)
-    staging.rename(out)
+    # Refuse before creating anything: an unmanaged destination is never deleted.
+    check_existing_bundle(out)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Build beside the destination so the final rename stays on one filesystem,
+    # and never leave a half-filled bundle where a deploy step could pick it up.
+    staging = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
+    try:
+        for rel, dest in plan.items():
+            target = staging / dest
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / rel, target)
+
+        produced = sorted(
+            p.relative_to(staging).as_posix() for p in staging.rglob("*") if p.is_file()
+        )
+        if produced != expected:
+            raise BuildError(
+                "bundle contents differ from the allowlist: "
+                f"unexpected={sorted(set(produced) - set(expected))} "
+                f"missing={sorted(set(expected) - set(produced))}",
+                code=2,
+            )
+
+        publish(staging, out)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return produced
 
 

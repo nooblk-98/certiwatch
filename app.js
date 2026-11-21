@@ -9,6 +9,8 @@
   var FETCH_TIMEOUT_MS = 15000;
   var DEFAULT_SORT = "days_asc";
   var THEME_KEY = "certiwatch-theme";
+  var FUTURE_SKEW_MS = 60 * 1000;
+  var FRESHNESS_TICK_MS = 60 * 1000;
 
   var ALLOWED_FILTERS = {
     ssl: ["all", "valid", "warn", "urgent", "soon", "expired", "error"],
@@ -89,7 +91,7 @@
     var ts = parseTimestamp(generatedAt);
     if (ts == null) return { stale: true, reason: "missing", ageMs: null, ts: null };
     var ageMs = now - ts;
-    if (ageMs < -60 * 60 * 1000) return { stale: false, reason: "future", ageMs: ageMs, ts: ts };
+    if (ageMs < -FUTURE_SKEW_MS) return { stale: false, reason: "future", ageMs: ageMs, ts: ts };
     if (ageMs > STALE_MS) return { stale: true, reason: "old", ageMs: ageMs, ts: ts };
     return { stale: false, reason: "fresh", ageMs: ageMs, ts: ts };
   }
@@ -101,6 +103,11 @@
     } catch (error) {
       return new Date(ts).toISOString();
     }
+  }
+
+  function exactTimestampText(value) {
+    var ts = parseTimestamp(value);
+    return ts == null ? value : formatTimestamp(ts);
   }
 
   function describeAge(ageMs) {
@@ -162,9 +169,10 @@
   function sslCategory(row) {
     var status = String(row.status || "").toLowerCase();
     var days = row.days_left;
-    if (status === "expired" || (status === "valid" && days != null && days <= 0)) return "expired";
+    if (row.is_expired === true || status === "expired") return "expired";
     if (status === "valid") {
       if (days == null) return "valid";
+      if (days <= 0) return "today";
       if (days <= 7) return "urgent";
       if (days <= 30) return "warn";
       return "valid";
@@ -203,15 +211,50 @@
       issued_on: cleanString(value.issued_on, 40),
       expires_on: cleanString(value.expires_on, 40),
       days_left: toNumberOrNull(value.days_left),
+      is_expired: typeof value.is_expired === "boolean" ? value.is_expired : null,
+      not_before: cleanString(value.not_before, 40),
+      not_after: cleanString(value.not_after, 40),
       error: cleanString(value.error, 400),
       checked_at: cleanString(value.checked_at, 80),
       raw: value
     };
-    ["provider", "issued_on", "expires_on", "error", "checked_at"].forEach(function (key) {
+    ["provider", "issued_on", "expires_on", "not_before", "not_after", "error", "checked_at"].forEach(function (key) {
       if (row[key] === "N/A" || row[key] === "n/a") row[key] = "";
     });
     row.category = sslCategory(row);
     return row;
+  }
+
+  /** A separate www fallback result, if the backend supplied one. */
+  function sslFallbackRow(value) {
+    if (!isPlainObject(value)) return null;
+    var candidate = value;
+    if (!cleanDomain(value.domain)) {
+      if (!value.host) return null;
+      var port = toNumberOrNull(value.port);
+      candidate = Object.assign({}, value, {
+        domain: port != null && port !== 443 ? value.host + ":" + port : value.host
+      });
+    }
+    return normalizeSslRow(candidate);
+  }
+
+  function expiryDaysText(row) {
+    if (row.category === "today") return "Expires today";
+    if (row.category === "expired") {
+      if (row.days_left == null || row.days_left === 0) return "Expired";
+      var ago = Math.abs(row.days_left);
+      return "Expired " + ago + (ago === 1 ? " day" : " days") + " ago";
+    }
+    if (row.days_left == null) return "Not available";
+    return row.days_left + (row.days_left === 1 ? " day" : " days") + " left";
+  }
+
+  function expiryStateText(row) {
+    if (row.category === "today") return "expires today";
+    if (row.category === "expired") return "expired";
+    if (row.category === "error" || row.category === "invalid" || row.category === "unknown") return "unknown";
+    return "valid";
   }
 
   function normalizeDomainRow(value) {
@@ -257,9 +300,12 @@
   }
 
   function searchText(row) {
+    var fallback = row.raw && isPlainObject(row.raw.fallback)
+      ? (row.raw.fallback.domain || row.raw.fallback.host || "")
+      : "";
     return [
       row.domain, row.provider, row.registrar, row.status,
-      row.port == null ? "" : row.port, row.error
+      row.port == null ? "" : row.port, row.error, fallback
     ].join(" ").toLowerCase();
   }
 
@@ -267,12 +313,12 @@
     if (filter === "all" || !filter) return true;
     var category = row.category;
     if (filter === "soon") {
-      return row.days_left != null && row.days_left > 0 && row.days_left <= 30;
+      return category === "today" || category === "urgent" || category === "warn" || category === "warning";
     }
     if (key === "ssl") {
       if (filter === "valid") return category === "valid";
       if (filter === "warn") return category === "warn";
-      if (filter === "urgent") return category === "urgent";
+      if (filter === "urgent") return category === "urgent" || category === "today";
       if (filter === "expired") return category === "expired";
       if (filter === "error") return category === "error" || category === "invalid";
       return false;
@@ -294,7 +340,7 @@
   function sortRows(key, rows, sort) {
     var copy = rows.slice();
     var ranks = key === "ssl"
-      ? { error: 0, expired: 1, urgent: 2, warn: 3, invalid: 4, valid: 5 }
+      ? { error: 0, expired: 1, today: 2, urgent: 3, warn: 4, invalid: 5, valid: 6 }
       : { unknown: 0, expired: 1, urgent: 2, warning: 3, active: 4 };
     function rank(row) {
       var value = ranks[row.category];
@@ -394,11 +440,15 @@
 
   var pureApi = {
     STALE_MS: STALE_MS,
+    FUTURE_SKEW_MS: FUTURE_SKEW_MS,
     DEFAULT_SORT: DEFAULT_SORT,
     parseTimestamp: parseTimestamp,
     staleness: staleness,
     normalizeSslRow: normalizeSslRow,
     normalizeDomainRow: normalizeDomainRow,
+    sslFallbackRow: sslFallbackRow,
+    expiryDaysText: expiryDaysText,
+    expiryStateText: expiryStateText,
     validateSslPayload: function (json) { return validatePayload(json, "ssl"); },
     validateDomainPayload: function (json) { return validatePayload(json, "domain"); },
     sslCategory: sslCategory,
@@ -441,7 +491,7 @@
   function newDataset() {
     return {
       rows: [], generatedAt: null, skipped: 0,
-      status: "loading", error: null,
+      status: "loading", error: null, refreshError: null,
       filter: "all", q: "", sort: DEFAULT_SORT,
       open: new Set()
     };
@@ -489,12 +539,27 @@
   }
 
   function loadDataset(key) {
+    return fetchDataset(key, { background: false });
+  }
+
+  function revalidateDataset(key) {
+    return fetchDataset(key, { background: state[key].status === "ready" });
+  }
+
+  var inFlight = { ssl: null, domain: null };
+
+  function fetchDataset(key, options) {
     var ds = state[key];
     var cfg = DATASETS[key];
-    ds.status = "loading";
-    ds.error = null;
-    renderLoading(key);
-    return fetchJson(cfg.file).then(function (payload) {
+    var background = !!(options && options.background);
+    if (inFlight[key]) return inFlight[key];
+    if (!background) {
+      ds.status = "loading";
+      ds.error = null;
+      ds.refreshError = null;
+      renderLoading(key);
+    }
+    var request = fetchJson(cfg.file).then(function (payload) {
       var parsed = validatePayload(payload, key);
       if (!parsed.ok) {
         throw new DataError("The file did not contain the expected list of " + cfg.noun + " (" + parsed.reason + ").");
@@ -503,16 +568,46 @@
       ds.generatedAt = parsed.generatedAt;
       ds.skipped = parsed.skipped;
       ds.status = "ready";
+      ds.error = null;
+      ds.refreshError = null;
       renderPanel(key);
     }).catch(function (error) {
+      var message = error instanceof DataError ? error.message : "The results could not be loaded.";
+      if (background && ds.status === "ready") {
+        ds.refreshError = message;
+        renderNote(key);
+        return;
+      }
       ds.rows = [];
       ds.generatedAt = null;
       ds.skipped = 0;
       ds.status = "error";
-      ds.error = error instanceof DataError ? error.message : "The results could not be loaded.";
+      ds.error = message;
       renderError(key);
     }).then(function () {
       updateGlobalAlert();
+    });
+    inFlight[key] = request;
+    request.then(function () {
+      if (inFlight[key] === request) inFlight[key] = null;
+    }, function () {
+      if (inFlight[key] === request) inFlight[key] = null;
+    });
+    return request;
+  }
+
+  function updateFreshnessViews() {
+    ["ssl", "domain"].forEach(function (key) {
+      if (state[key].status === "ready") renderStale(key);
+    });
+    updateHeader();
+  }
+
+  function revalidateVisible() {
+    if (document.visibilityState !== "visible") return;
+    updateFreshnessViews();
+    ["ssl", "domain"].forEach(function (key) {
+      revalidateDataset(key);
     });
   }
 
@@ -676,7 +771,7 @@
         statCard("sc-total", "Total", ds.rows.length, "monitored"),
         statCard("sc-ok", "Valid", countCategory(ds.rows, "valid"), "> 30 days left"),
         statCard("sc-warn", "Warning", countCategory(ds.rows, "warn"), "8–30 days left"),
-        statCard("sc-urgent", "Urgent", countCategory(ds.rows, "urgent"), "≤ 7 days left"),
+        statCard("sc-urgent", "Urgent", countCategory(ds.rows, "urgent") + countCategory(ds.rows, "today"), "≤ 7 days left"),
         statCard("sc-exp", "Expired", countCategory(ds.rows, "expired"), "action needed"),
         statCard("sc-err", "Issues", issues, "invalid or unreachable")
       ];
@@ -845,7 +940,8 @@
     if (info.reason === "missing") {
       message = "These results do not include a readable generated time, so their freshness cannot be confirmed.";
     } else if (info.reason === "future") {
-      message = "The generated time is in the future (" + formatTimestamp(info.ts) + "). Check the clock on the machine that ran the check.";
+      message = "Suspect future timestamp: the file says it was generated " + formatTimestamp(info.ts) +
+        " (" + describeAge(info.ageMs) + "), which is ahead of this device's clock. Check the clock on the machine that ran the check before trusting freshness.";
     } else if (info.reason === "fresh") {
       message = oldChecks + " row check" + (oldChecks === 1 ? " is" : "s are") + " older than 36 hours, even though the file was generated recently.";
     } else {
@@ -862,6 +958,7 @@
     var category = row.category;
     if (key === "ssl") {
       if (category === "valid") return "Valid";
+      if (category === "today") return "Expires today";
       if (category === "warn") return "Warning";
       if (category === "urgent") return "Urgent";
       if (category === "expired") return "Expired";
@@ -885,6 +982,7 @@
     var icon;
     if (key === "ssl") {
       if (category === "valid") { cls = "b-green"; icon = "✓"; }
+      else if (category === "today") { cls = "b-orange"; icon = "⏳"; }
       else if (category === "warn") { cls = "b-yellow"; icon = "⚠"; }
       else if (category === "urgent") { cls = "b-orange"; icon = "⚡"; }
       else if (category === "expired") { cls = "b-red"; icon = "✗"; }
@@ -906,16 +1004,18 @@
   }
 
   function daysSentence(row) {
+    if (row.category === "today") return "Expires today";
     if (row.category === "error" || row.category === "invalid" || row.category === "unknown") {
       return "No expiry data";
     }
+    if (row.category === "expired") return "Expired";
     if (row.days_left == null) return "No expiry data";
     if (row.days_left <= 0) return "Expired";
     return row.days_left + "d left";
   }
 
   function attentionScore(key, category) {
-    var ssl = { expired: 0, urgent: 1, error: 2, invalid: 3, warn: 4 };
+    var ssl = { expired: 0, today: 1, urgent: 2, error: 3, invalid: 4, warn: 5 };
     var domain = { expired: 0, urgent: 1, unknown: 2, warning: 3 };
     var table = key === "ssl" ? ssl : domain;
     var score = table[category];
@@ -962,19 +1062,24 @@
     var summary = byId(cfg.prefix + "-timeline-summary");
     if (!container || !legend || !summary) return;
     var buckets = [
-      { id: "expired", label: "Expired", cls: "seg-expired", match: function (d) { return d != null && d <= 0; } },
-      { id: "d7", label: "≤ 7 days", cls: "seg-d7", match: function (d) { return d != null && d > 0 && d <= 7; } },
-      { id: "d30", label: "8–30 days", cls: "seg-d30", match: function (d) { return d != null && d > 7 && d <= 30; } },
-      { id: "d90", label: "31–90 days", cls: "seg-d90", match: function (d) { return d != null && d > 30 && d <= 90; } },
-      { id: "d365", label: "91–365 days", cls: "seg-d365", match: function (d) { return d != null && d > 90 && d <= 365; } },
-      { id: "later", label: "> 365 days", cls: "seg-later", match: function (d) { return d != null && d > 365; } },
-      { id: "unknown", label: "No date", cls: "seg-unknown", match: function (d) { return d == null; } }
+      { id: "expired", label: "Expired", cls: "seg-expired", match: function (row) { return row.category === "expired"; } }
     ];
+    if (key === "ssl") {
+      buckets.push({ id: "today", label: "Expires today", cls: "seg-d7", match: function (row) { return row.category === "today"; } });
+    }
+    buckets = buckets.concat([
+      { id: "d7", label: "≤ 7 days", cls: "seg-d7", match: function (row) { return row.category === "urgent"; } },
+      { id: "d30", label: "8–30 days", cls: "seg-d30", match: function (row) { return row.category === "warn" || row.category === "warning"; } },
+      { id: "d90", label: "31–90 days", cls: "seg-d90", match: function (row) { var d = row.days_left; return d != null && d > 30 && d <= 90; } },
+      { id: "d365", label: "91–365 days", cls: "seg-d365", match: function (row) { var d = row.days_left; return d != null && d > 90 && d <= 365; } },
+      { id: "later", label: "> 365 days", cls: "seg-later", match: function (row) { var d = row.days_left; return d != null && d > 365; } },
+      { id: "unknown", label: "No date", cls: "seg-unknown", match: function (row) { return row.days_left == null; } }
+    ]);
     var counts = {};
     buckets.forEach(function (bucket) { counts[bucket.id] = 0; });
     ds.rows.forEach(function (row) {
       for (var index = 0; index < buckets.length; index += 1) {
-        if (buckets[index].match(row.days_left)) {
+        if (buckets[index].match(row)) {
           counts[buckets[index].id] += 1;
           return;
         }
@@ -997,7 +1102,7 @@
         container.append(segment);
       }
     });
-    var due = counts.d7 + counts.d30;
+    var due = (counts.today || 0) + counts.d7 + counts.d30;
     var parts = [];
     if (total === 0) {
       parts.push("No expiry data available.");
@@ -1046,29 +1151,38 @@
     return (words[0].charAt(0) + (words.length > 1 ? words[1].charAt(0) : "")).toUpperCase();
   }
 
-  function toneForDays(days) {
-    if (days == null) return "tone-gray";
-    if (days <= 0) return "tone-red";
-    if (days <= 7) return "tone-orange";
-    if (days <= 30) return "tone-yellow";
+  function toneForDays(row) {
+    if (row.days_left == null) return "tone-gray";
+    if (row.category === "today") return "tone-orange";
+    if (row.category === "expired") return "tone-red";
+    if (row.days_left <= 7) return "tone-orange";
+    if (row.days_left <= 30) return "tone-yellow";
     return "tone-green";
   }
 
-  function buildDays(days) {
+  function buildDays(row) {
+    var days = row.days_left;
     var wrap = el("div", "bar-wrap");
     if (days == null) {
       wrap.append(el("span", "tone-gray", "N/A"));
       wrap.setAttribute("aria-label", "Days left not available");
       return wrap;
     }
-    var percent = Math.max(0, Math.min(100, (Math.max(0, days) / 365) * 100));
+    var percent = row.category === "today" ? 0 : Math.max(0, Math.min(100, (Math.max(0, days) / 365) * 100));
+    var tone = toneForDays(row);
     var bar = el("div", "bar");
-    var fill = el("div", "bar-fill " + toneForDays(days));
+    var fill = el("div", "bar-fill " + tone);
     fill.style.width = percent.toFixed(2) + "%";
     bar.append(fill);
-    var tone = toneForDays(days);
-    wrap.append(bar, el("span", "bar-num " + tone, days + "d"));
-    wrap.setAttribute("aria-label", days <= 0 ? "Expired " + Math.abs(days) + " days ago" : days + " days left");
+    var label = row.category === "today" ? "Today" : days + "d";
+    wrap.append(bar, el("span", "bar-num " + tone, label));
+    if (row.category === "today") {
+      wrap.setAttribute("aria-label", "Expires today");
+    } else if (row.category === "expired") {
+      wrap.setAttribute("aria-label", days === 0 ? "Expired" : "Expired " + Math.abs(days) + " days ago");
+    } else {
+      wrap.setAttribute("aria-label", days + " days left");
+    }
     return wrap;
   }
 
@@ -1115,7 +1229,7 @@
 
     var dateCell;
     var daysCell = makeCell("Days Left");
-    daysCell.append(buildDays(row.days_left));
+    daysCell.append(buildDays(row));
     var statusCell = makeCell("Status");
     statusCell.append(badgeFor(key, row));
     var detailCell = makeCell("Details", "cell-details");
@@ -1173,15 +1287,17 @@
   }
 
   var SSL_OPTIONAL_FIELDS = [
-    ["subject", "Subject"], ["issuer", "Issuer"],
+    ["subject", "Subject"], ["issuer", "Issuer"], ["common_name", "Common name"],
     ["serial_number", "Serial number"], ["serial", "Serial number"],
     ["signature_algorithm", "Signature algorithm"],
-    ["key_type", "Key type"], ["key_size", "Key size"], ["key_algorithm", "Key algorithm"],
-    ["tls_version", "TLS version"],
-    ["subject_alt_names", "Subject alternative names"], ["sans", "Subject alternative names"], ["san", "Subject alternative names"],
+    ["key_type", "Key type"], ["key_size", "Key size"], ["key_algorithm", "Key algorithm"], ["key_curve", "Key curve"],
+    ["tls_version", "TLS version"], ["cipher", "Cipher"],
+    ["subject_alt_names", "Subject alternative names"], ["sans", "Subject alternative names"], ["san", "Subject alternative names"], ["san_count", "SAN count"],
+    ["wildcard", "Wildcard"], ["hostname_matches", "Hostname matches"],
     ["chain", "Certificate chain"], ["chain_valid", "Chain valid"], ["chain_length", "Chain length"],
+    ["trusted_chain", "Trusted chain"], ["chain_source", "Chain source"], ["chain_error", "Chain error"],
     ["fingerprint_sha256", "SHA-256 fingerprint"], ["fingerprint", "Fingerprint"],
-    ["ocsp_status", "OCSP status"], ["resolved_via", "Resolved via"]
+    ["ocsp_status", "OCSP status"], ["revocation_status", "Revocation status"], ["resolved_via", "Resolved via"]
   ];
 
   var DOMAIN_OPTIONAL_FIELDS = [
@@ -1211,7 +1327,9 @@
       pairs.push(["Provider", row.provider || "Not available"]);
       pairs.push(["Issued on", row.issued_on || "Not available"]);
       pairs.push(["Expires on", row.expires_on || "Not available"]);
-      pairs.push(["Days left", row.days_left == null ? "Not available" : String(row.days_left)]);
+      if (row.not_after) pairs.push(["Exact expiry", exactTimestampText(row.not_after)]);
+      if (row.not_before) pairs.push(["Not before", exactTimestampText(row.not_before)]);
+      pairs.push(["Days left", expiryDaysText(row)]);
       var target = hostAndPort(row);
       pairs.push(["Port", target ? String(target.port) : "Not available"]);
       pairs.push(["Checked at", row.checked_at || "Not recorded"]);
@@ -1235,6 +1353,31 @@
       " -showcerts </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -dates -fingerprint -sha256";
   }
 
+  function fillDetailList(list, pairs) {
+    pairs.forEach(function (pair) {
+      var item = el("div", "detail-item");
+      item.append(el("dt", null, pair[0]), el("dd", null, pair[1]));
+      list.append(item);
+    });
+  }
+
+  function appendFallbackDetails(panel, row) {
+    var fallback = sslFallbackRow(row.raw ? row.raw.fallback : null);
+    if (!fallback) return;
+    var box = el("div", "detail-command");
+    var head = el("div", "detail-command-head");
+    head.append(el("span", null, "Fallback check"));
+    var body = el("div", "detail-panel");
+    body.append(el("p", null,
+      "Separate result for " + fallback.domain + "; the configured endpoint result above is unchanged."));
+    var list = el("dl", "detail-grid");
+    fillDetailList(list, [["Domain", fallback.domain], ["Backend status", fallback.status]]
+      .concat(detailPairs("ssl", fallback)));
+    body.append(list);
+    box.append(head, body);
+    panel.append(box);
+  }
+
   function buildDetailRow(key, row, detailId, open) {
     var cfg = DATASETS[key];
     var tr = el("tr", "detail-row");
@@ -1247,11 +1390,7 @@
     var panel = el("div", "detail-panel");
     panel.append(el("h3", null, key === "ssl" ? "Certificate details" : "Domain details"));
     var list = el("dl", "detail-grid");
-    detailPairs(key, row).forEach(function (pair) {
-      var item = el("div", "detail-item");
-      item.append(el("dt", null, pair[0]), el("dd", null, pair[1]));
-      list.append(item);
-    });
+    fillDetailList(list, detailPairs(key, row));
     panel.append(list);
     if (key === "ssl") {
       var command = opensslCommand(row);
@@ -1272,6 +1411,7 @@
         copyStatus.setAttribute("aria-live", "polite");
         panel.append(copyStatus);
       }
+      appendFallbackDetails(panel, row);
     }
     cell.append(panel);
     tr.append(cell);
@@ -1324,13 +1464,25 @@
     var box = byId(cfg.prefix + "-note");
     var text = byId(cfg.prefix + "-note-text");
     if (!box || !text) return;
-    if (ds.status !== "ready" || !ds.skipped) {
+    if (ds.status !== "ready") {
       box.hidden = true;
       return;
     }
+    var messages = [];
+    if (ds.refreshError) {
+      messages.push("Could not refresh results: " + ds.refreshError + " Showing the last loaded data.");
+    }
+    if (ds.skipped) {
+      messages.push(ds.skipped + " row" + (ds.skipped === 1 ? "" : "s") +
+        " in this result file could not be read and " + (ds.skipped === 1 ? "was" : "were") + " skipped.");
+    }
+    if (!messages.length) {
+      box.hidden = true;
+      text.textContent = "";
+      return;
+    }
     box.hidden = false;
-    text.textContent = ds.skipped + " row" + (ds.skipped === 1 ? "" : "s") +
-      " in this result file could not be read and " + (ds.skipped === 1 ? "was" : "were") + " skipped.";
+    text.textContent = messages.join(" ");
   }
 
   function renderPanel(key) {
@@ -1382,7 +1534,9 @@
     }
     var info = staleness(ds.generatedAt);
     text.textContent = "Updated " + formatTimestamp(info.ts);
-    text.title = "Generated: " + ds.generatedAt;
+    text.title = info.reason === "future"
+      ? "Suspect future generated timestamp: " + ds.generatedAt
+      : "Generated: " + ds.generatedAt;
     if (info.reason !== "fresh" || countOldChecks(ds.rows) > 0) dot.classList.add("stale");
   }
 
@@ -1435,10 +1589,11 @@
     var headers;
     var matrix;
     if (key === "ssl") {
-      headers = ["Domain", "Port", "Status", "Provider", "Issued On", "Expires On", "Days Left", "Checked At", "Error"];
+      headers = ["Domain", "Port", "Status", "Provider", "Issued On", "Expires On", "Days Left", "Expiry State", "Checked At", "Error"];
       matrix = rows.map(function (row) {
         return [row.domain, row.port == null ? "" : row.port, row.status, row.provider,
-          row.issued_on, row.expires_on, row.days_left == null ? "" : row.days_left, row.checked_at, row.error];
+          row.issued_on, row.expires_on, row.days_left == null ? "" : row.days_left,
+          expiryStateText(row), row.checked_at, row.error];
       });
     } else {
       headers = ["Domain", "Status", "Registrar", "Purchase Date", "Expiry Date", "Days Left"];
@@ -1590,6 +1745,11 @@
 
     window.addEventListener("hashchange", function () {
       applyHashState(parseHashState(window.location.hash));
+    });
+
+    setInterval(updateFreshnessViews, FRESHNESS_TICK_MS);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible") revalidateVisible();
     });
 
     loadDataset("ssl");

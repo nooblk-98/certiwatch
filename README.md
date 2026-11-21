@@ -43,6 +43,8 @@ It reads domain lists from plain text config files, runs checks in parallel, and
 - `pages/_headers` - Cloudflare Pages cache policy for the result files
 - `scripts/build_dist.py` - Stages the allowlisted Pages publish directory
 - `scripts/test_build_dist.py` - Tests for the staging script
+- `tests/` - Offline pytest and `node --test` suites used by CI
+- `requirements.txt` - Python runtime dependency for the checkers
 - `src/validate_conf.py` - Config validator + auto-fixer
 - `src/domain/scripts/check_domains.py` - Domain expiry checker
 - `src/domain/scripts/check_LK_domains.py` - .lk expiry helper
@@ -108,6 +110,10 @@ What the tool does automatically:
 - Python 3.10+
 - Python package: cryptography
 
+Python 3.13 or newer is recommended: the checker can then read the full
+certificate chain the server presents (`chain_source: "verified"`), and CI uses
+3.13. On older interpreters only the leaf certificate is reported.
+
 Install dependency:
 
 ```bash
@@ -160,7 +166,9 @@ python3 -m http.server --directory dist 8000
 ```
 
 `dist/` is exactly what Cloudflare Pages receives. The build fails if a
-required input is missing, empty or not valid result JSON.
+required input is missing, empty or not valid result JSON; it also refuses
+symlinked inputs, an unsafe destination, and a TLS run in which no certificate
+could be read. See [Publish safety rules](#publish-safety-rules).
 
 ## Generated data and Git
 
@@ -168,7 +176,7 @@ required input is missing, empty or not valid result JSON.
 
 - They are git-ignored and no longer committed. A fresh clone has neither file
   until you run the checkers.
-- Every workflow run regenerates them on the runner and publishes only those
+- Every publishing run regenerates them on the runner and publishes only those
   generated copies. The repository keeps no result history, and each deployment
   replaces the live JSON, so the dashboard always shows the newest run.
 - The workflow has `permissions: contents: read` and no commit step; it cannot
@@ -176,6 +184,10 @@ required input is missing, empty or not valid result JSON.
   serves therefore differ by design.
 - Missing, empty, unparseable or zero-row result files fail the build before
   anything is deployed, rather than publishing an empty or broken dashboard.
+- A TLS run in which every row is a DNS, connection, handshake or input failure
+  also fails the build: no certificate was read, so the published results stay
+  as they were. Runs that contain real certificate verdicts publish normally,
+  including `expired` and `invalid` rows.
 
 ## Environment Variables
 
@@ -210,6 +222,41 @@ Domain expiry status values commonly include:
 - `expired`
 - `unknown`
 
+## Trust and interpretation limits
+
+The SSL checker reports what the machine that ran it could verify. Read these
+fields with that in mind:
+
+- `trusted_chain` uses the trust store of the runner: the OpenSSL defaults of
+  the Python installation, or the bundle named in `SSL_CA_FILE`. A certificate
+  that works in a browser can be reported `invalid` here when the runner lacks a
+  recently added root; a private CA is trusted only after it is added to that
+  store. `chain_error` keeps the raw verification message.
+- A server that does not send its intermediate certificates produces a chain
+  error even though browsers can often fill the gap themselves. That is a real
+  server configuration problem, not a checker failure, and it is reported as
+  `invalid` with the verification text.
+- Chain trust and hostname coverage are judged separately. `trusted_chain: true`
+  with `hostname_matches: false` means the certificate is genuine but issued for
+  another name; `trusted_chain: false` with `hostname_matches: true` means the
+  chain itself did not validate.
+- Hostname matching uses the SAN entries only, per RFC 6125 and the CA/Browser
+  Forum baseline requirements; a subject CN is never accepted as a substitute.
+- The presented chain is read through `get_verified_chain` /
+  `get_unverified_chain`, available on Python 3.13+. Older interpreters report
+  the leaf only and set `chain_source` to `"leaf"`.
+- Revocation (OCSP/CRL) is **not** checked: `revocation_checked` is always
+  `false` and `revocation_status` is `not_checked`.
+- Expiry is decided by the exact `not_after` timestamp (`is_expired`).
+  `days_left` is floored for display, so a certificate with hours left can show
+  `0` days and still be `valid`.
+- Domain expiry uses RDAP with a WHOIS fallback, and the register.domains.lk
+  helper for `.lk`. An `unknown` status means neither source answered - not that
+  the domain is unregistered.
+- A jump in `www.` availability is reported, not hidden: when the configured
+  host cannot be reached on port 443, the row keeps its own failure status and a
+  separate `fallback` object may carry the `www.<host>` result.
+
 ## Suggested Workflow
 
 1. Update `domains.conf` and `ssl.conf`.
@@ -224,28 +271,67 @@ Cloudflare Pages. It is the only deployment path; nothing is deployed by hand.
 
 ### Triggers
 
-| Trigger | When |
+| Trigger | What runs |
 |---|---|
-| `schedule` | Every day at **06:00 Asia/Colombo (UTC+5:30)**, i.e. **00:30 UTC** |
-| `push` to `main` | Only when a relevant file changes: `index.html`, `app.js`, `style.css`, `ssl.conf`, `domains.conf`, `pages/_headers`, the checker/validator scripts, the staging scripts, or the workflow itself |
-| `workflow_dispatch` | Manual run from the GitHub Actions tab |
+| `pull_request` | Offline checks only. A pull request never publishes, needs no secrets, and makes no external probes. |
+| `push` to `main` | Offline checks, then the certificate checks and a publish. Only for files that affect the checks, the dashboard or the published bundle. |
+| `schedule` | Every day at **06:00 Asia/Colombo (UTC+5:30)**, i.e. **00:30 UTC**. |
+| `workflow_dispatch` | Manual run from the GitHub Actions tab. Publishes only from `main`. |
 
-A publishing run is never cancelled mid-deploy: a second run waits behind it
-(`concurrency: certiwatch-pages`).
+Superseded pull-request runs are cancelled. A run on `main` is never cancelled
+mid-publish: a second one waits behind it (`concurrency: certiwatch-${{ github.ref }}`).
 
-### What a run does
+### Automated checks
 
-1. Fails immediately when a required input is missing or empty (`ssl.conf`,
+The `verify` job runs offline on every trigger and must pass before anything can
+be published:
+
+| Check | Command |
+|---|---|
+| Python unit tests (in-memory certificates, local TLS servers only) | `python -m pytest -q -p no:cacheprovider` |
+| Dashboard tests | `node --test tests/dashboard.test.mjs` |
+| Publish-bundle tests | `python3 scripts/test_build_dist.py` |
+
+Run the same three commands before opening a pull request. None of them needs
+network access, credentials or the production configuration, so a pull request
+can be verified on a fork.
+
+The publish job declares `needs: verify`, so a `main` run - push, schedule or
+manual - cannot deploy unless all three suites pass first.
+
+### What a publishing run does
+
+1. Fails when a required input is missing, empty or a symlink (`ssl.conf`,
    `domains.conf`, `index.html`, `pages/_headers`, `scripts/build_dist.py`).
 2. Validates and normalises `ssl.conf` and `domains.conf` (checkout copy only).
 3. Runs the SSL and domain checkers, writing both result files on the runner.
-4. Runs `scripts/test_build_dist.py` so the packaging rules are checked before
-   anything can be published.
-5. Stages the publish directory with `scripts/build_dist.py`.
-6. Deploys `dist/` to Cloudflare Pages.
+4. Stages the publish directory with `scripts/build_dist.py`.
+5. Deploys `dist/` to Cloudflare Pages, from `main` only.
 
 It does **not** commit the results back to `main`; see
 [Generated data and Git](#generated-data-and-git).
+
+### Publish safety rules
+
+`scripts/build_dist.py` refuses to build rather than publish something wrong:
+
+- **Missing, empty or malformed input**, including a result file with no rows.
+- **Unreadable TLS run**: when *every* SSL row ended in DNS, connection,
+  handshake or input failure (`dns_error`, `timeout`, `no_https`, `ssl_error`,
+  `error`), no certificate was read. That is a runner without egress or a
+  network outage, so production is left untouched. Any run containing at least
+  one real verdict (`valid`, `expired`, `invalid`) publishes normally, so
+  expiring and invalid certificates are still reported.
+- **Symlinked inputs**: a symlinked file, or a symlinked parent directory such as
+  `pages`, is refused, so nothing outside the checkout can enter the bundle.
+- **Unsafe destinations**: output outside the checkout is allowed; inside it only
+  `dist` is. A non-empty destination is replaced only if every entry is a file
+  this builder produces and `_headers` is present; otherwise it is refused and
+  left intact.
+
+The build assembles a hidden sibling directory and swaps it into place at the
+end, so a failed run never leaves a half-filled `dist/` behind for a deploy step
+to publish.
 
 ### Published bundle
 
@@ -279,6 +365,11 @@ Add these under **Settings → Secrets and variables → Actions**:
 | `CLOUDFLARE_ACCOUNT_ID` | secret | Cloudflare account ID |
 | `CLOUDFLARE_PAGES_PROJECT` | variable, optional | Pages project name; defaults to `certiwatch` |
 
+The deploy step is pinned to the verified `cloudflare/wrangler-action` release
+`v3.15.0` commit (`9acf94a…`) instead of a moving major tag, so a retagged or
+compromised tag cannot change what runs with the API token. `checkout` runs with
+`persist-credentials: false`; no step pushes to Git.
+
 ### Live Dashboard
 
 The dashboard is deployed to Cloudflare Pages and updates after each workflow run:
@@ -286,10 +377,11 @@ The dashboard is deployed to Cloudflare Pages and updates after each workflow ru
 **https://certiwatch.pages.dev**
 
 A Pages hostname is `<project-name>.pages.dev`, so the workflow deploys to the
-project `certiwatch`. The previous workflow targeted a project named
-`ssl-domain-monitor`; that account mapping has not been verified here, because
-confirming it needs Cloudflare dashboard access or a deploy. Before the first
-run, check **Workers & Pages** in Cloudflare:
+project `certiwatch`. **The production Cloudflare account mapping is unverified**:
+the previous workflow targeted a project named `ssl-domain-monitor`, and
+confirming the real one needs Cloudflare dashboard access or a deploy, neither
+of which happens from this repository. Before the first run, check
+**Workers & Pages** in Cloudflare:
 
 - if the project is already `certiwatch`, no change is needed;
 - if it is still `ssl-domain-monitor` (which serves `ssl-domain-monitor.pages.dev`),

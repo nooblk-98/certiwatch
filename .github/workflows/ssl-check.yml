@@ -1,6 +1,21 @@
-name: SSL Certificate Check
+name: CertiWatch checks
 
 on:
+  pull_request:
+    # Every change that can affect the checks, the dashboard, the tests or the
+    # published bundle is verified offline. Pull requests never publish.
+    paths:
+      - "requirements.txt"
+      - "index.html"
+      - "app.js"
+      - "style.css"
+      - "ssl.conf"
+      - "domains.conf"
+      - "pages/**"
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/ssl-check.yml"
   push:
     branches:
       - main
@@ -15,7 +30,6 @@ on:
       - "domains.conf"
       - "pages/_headers"
       - "scripts/build_dist.py"
-      - "scripts/test_build_dist.py"
       - "src/validate_conf.py"
       - "src/ssl/scripts/**"
       - "src/domain/scripts/**"
@@ -30,21 +44,62 @@ on:
 permissions:
   contents: read
 
-# Never let two runs race to publish the same Pages project. A queued run
-# waits for the current deploy instead of being cancelled mid-publish.
+# One publishing attempt per branch at a time. Superseded pull-request runs are
+# cancelled; a push or scheduled run on main waits instead of being killed
+# mid-publish.
 concurrency:
-  group: certiwatch-pages
-  cancel-in-progress: false
+  group: certiwatch-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check-ssl:
-    name: Check SSL Certificates
+  verify:
+    name: Offline checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Nothing in this workflow pushes; keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt pytest
+
+      - name: Python tests
+        # Offline: certificates are generated in memory, TLS servers are local.
+        run: python -m pytest -q -p no:cacheprovider
+
+      - name: Dashboard tests
+        run: node --test tests/dashboard.test.mjs
+
+      - name: Publish bundle tests
+        run: python3 scripts/test_build_dist.py
+
+  publish:
+    name: Check certificates and publish
+    # Production only runs after the offline checks pass.
+    needs: verify
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Verify required inputs
         run: |
@@ -58,13 +113,27 @@ jobs:
           done
           exit "$status"
 
+      - name: Reject symlinked inputs
+        # The staging step checks this again for every file it copies; this
+        # fails earlier and names the repository path.
+        run: |
+          set -euo pipefail
+          status=0
+          for file in ssl.conf domains.conf index.html pages pages/_headers scripts/build_dist.py; do
+            if [ -L "$file" ]; then
+              echo "::error file=$file::Input path '$file' is a symlink; refusing to run."
+              status=1
+            fi
+          done
+          exit "$status"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check cryptography
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Validate config files
         # Auto-fixes the checkout copy only; results are never committed.
@@ -76,17 +145,15 @@ jobs:
       - name: Run domain expiry checker
         run: python3 src/domain/scripts/check_domains.py
 
-      - name: Test the Pages bundle builder
-        run: python3 scripts/test_build_dist.py
-
       - name: Build Pages bundle
-        # Allowlisted staging: only the dashboard, the two generated result
-        # files and _headers reach dist/. Fails on missing or empty inputs.
+        # Allowlisted staging. Fails on missing, empty or malformed inputs, on a
+        # symlinked input, and on a TLS run where no certificate was read, so a
+        # broken runner cannot replace the published dashboard.
         run: python3 scripts/build_dist.py --out dist
 
       - name: Deploy to Cloudflare Pages
         if: github.ref == 'refs/heads/main'
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd  # v3.15.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
