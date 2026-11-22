@@ -10,6 +10,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: certiwatch:local
+    # Built locally, never pulled: stops "Re-pull image" in Portainer failing on certiwatch:local.
+    pull_policy: build
     restart: unless-stopped
     ports:
       - "${CERTIWATCH_PORT:-8080}:8080"
