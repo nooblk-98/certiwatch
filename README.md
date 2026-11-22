@@ -10,7 +10,7 @@ Configure targets in `certiwatch.toml` and open the read-only dashboard.
 
 ![CertiWatch Command Center dashboard (dark theme)](docs/dashboard.png)
 
-*Command Center dashboard, dark theme (default): status banner, KPI row, urgency-sorted certificate table with expandable details, expiry radar, needs-attention list and issuers. A Dark/Light switch in the header remembers your choice in a cookie.*
+*Command Center dashboard, dark theme (default): status banner, KPI row, certificate table grouped by urgency (healthy group collapsed) with expandable details, clickable expiry radar, a 30-day renewal calendar and issuers. A Dark/Light switch in the header remembers your choice in a cookie.*
 
 ![CertiWatch Command Center dashboard (light theme)](docs/dashboard-light.png)
 
