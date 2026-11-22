@@ -15,7 +15,7 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["http1", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-hickory-proto = { version = "0.25", default-features = false, features = ["tokio", "dnssec-ring"] }
+hickory-proto = { version = "0.26.2", default-features = false, features = ["dnssec-ring"] }
 openssl = "0.10"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

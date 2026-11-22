@@ -59,18 +59,32 @@ fn log_run(summary: &crate::service::RunSummary) {
     } else {
         "previous snapshot kept"
     };
+    let delivery = match (&summary.delivery_error, summary.delivered) {
+        (Some(error), _) => format!("delivery failed: {error}"),
+        (None, delivered) => format!("delivered {delivered}"),
+    };
+    let detail = [
+        summary.error.clone(),
+        summary.publish_error.clone(),
+        summary
+            .deadline_exceeded
+            .then(|| "run deadline exceeded; writers were drained".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("; ");
     eprintln!(
-        "certiwatch: refresh {result} trigger={} ssl={} domains={} events={} delivered={} ({} ms, {published}){}",
+        "certiwatch: refresh {result} trigger={} ssl={} domains={} events={} ({} ms, {published}, {delivery}){}",
         summary.trigger,
         summary.ssl_rows,
         summary.domain_rows,
         summary.events,
-        summary.delivered,
         summary.duration_ms,
-        summary
-            .error
-            .as_deref()
-            .map(|error| format!(": {error}"))
-            .unwrap_or_default()
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
     );
 }

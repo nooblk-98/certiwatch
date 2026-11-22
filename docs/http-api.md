@@ -210,14 +210,16 @@ Dashboard categories:
   (`days <= 0` today, `<= 7` urgent, `<= 30` warning)
 - registration: `expired | urgent | warning | active | unknown`
 - domain badge: `critical` when a certificate is expired/today/invalid or a
-  registration is expired; `warning` when a check is missing, unreachable or
-  inside a 30-day window; `unknown` when both checks are unknown; otherwise
-  `ok`.
+  registration is expired; `warning` when a configured check is missing,
+  unreachable or inside a 30-day window; `unknown` when every configured check
+  is unknown; otherwise `ok`. A check that is not configured for the deployment
+  is ignored rather than treated as missing.
 
 `certificate` or `registration` is `null` when that check is not configured.
 
-`status.json` is published only when both result sets have at least one row; a
-registration-only or certificate-only deployment keeps the previous feeds.
+`status.json`, `expiries.ics` and `badges/manifest.json` are published when at
+least one result set has a row. A certificate-only or registration-only
+deployment builds them from the checks it has.
 
 ## Badges
 

@@ -9,17 +9,23 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use serde_json::{json, Value};
+use url::Url;
 
 use crate::config::Target;
 use crate::dns::{diagnose_dns, Resolver};
 use crate::results::{base_domain_result, dns_not_checked, JsonMap};
+
+use ureq::config::Config as UreqConfig;
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver as UreqResolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 pub const RDAP_HEADERS: &[(&str, &str)] = &[
     ("User-Agent", "Mozilla/5.0 (DomainExpiryChecker/1.0)"),
@@ -437,8 +443,8 @@ fn get_rdap_base_url(client: &dyn RegistrationClient, domain: &str) -> Option<St
         }
         for item in urls {
             if let Some(url) = item.as_str() {
-                if url.starts_with("http") {
-                    return Some(url.to_string());
+                if let Ok(parsed) = validate_registration_url(url) {
+                    return Some(parsed.to_string());
                 }
             }
         }
@@ -455,8 +461,11 @@ fn get_whois_server(client: &dyn RegistrationClient, domain: &str) -> Option<Str
                 .split_once(':')
                 .map(|(_, rest)| rest.trim())
                 .unwrap_or("");
-            if !server.is_empty() {
-                return Some(server.to_string());
+            // The referral is untrusted input: accept only a hostname or IP
+            // literal. The WHOIS client resolves and checks it again before
+            // dialling, so a public name that rebinds is still filtered.
+            if let Some(server) = whois_host(server) {
+                return Some(server);
             }
         }
     }
@@ -601,11 +610,14 @@ impl AdaptiveLimiter {
 }
 
 fn retry_after_seconds(value: Option<&str>) -> Option<Duration> {
-    let value = value?.trim();
-    value
-        .parse::<f64>()
-        .ok()
-        .map(|seconds| Duration::from_secs_f64(seconds.max(0.0)))
+    const MAX_RETRY_AFTER_SECONDS: f64 = 86_400.0;
+    let seconds = value?.trim().parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(
+        seconds.min(MAX_RETRY_AFTER_SECONDS),
+    ))
 }
 
 fn get_lk_expiry(
@@ -787,6 +799,184 @@ pub fn check_domain(
 
 // ── Production client ────────────────────────────────────────────────────────
 
+/// A conservative public-unicast check for addresses this process may connect
+/// to for registration data. Loopback, private, link-local, shared, reserved,
+/// documentation, multicast and transition ranges are all refused.
+pub fn is_public_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_ipv4(*v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_public_ipv4(mapped);
+            }
+            is_public_ipv6(*v6)
+        }
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 192 && b == 0 && matches!(c, 0 | 2))
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && matches!(b, 18 | 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let global_unicast = segments[0] & 0xe000 == 0x2000;
+    let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    let teredo = segments[0] == 0x2001 && segments[1] == 0;
+    let orchid = segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020);
+    let benchmarking = segments[0] == 0x2001 && segments[1] == 0x0002;
+    let six_to_four = segments[0] == 0x2002;
+    let new_documentation = segments[0] & 0xfff0 == 0x3ff0;
+    global_unicast
+        && !documentation
+        && !teredo
+        && !orchid
+        && !benchmarking
+        && !six_to_four
+        && !new_documentation
+}
+
+/// Resolve a host to only public unicast addresses. Literal IPs are checked
+/// directly; DNS answers are filtered before the caller dials any of them.
+pub fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err("registration host is empty".into());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_public_ip(&ip) {
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        return Err(format!(
+            "registration host {host} is not a public unicast address"
+        ));
+    }
+    let resolved = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("cannot resolve {host}: {error}"))?;
+    let addresses: Vec<SocketAddr> = resolved.filter(|addr| is_public_ip(&addr.ip())).collect();
+    if addresses.is_empty() {
+        return Err(format!(
+            "registration host {host} resolves only to non-public addresses"
+        ));
+    }
+    Ok(addresses)
+}
+
+/// A ureq resolver that pins every connection to a vetted public address, so
+/// a redirect or DNS answer cannot steer the request at a local service.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PublicResolver;
+
+impl UreqResolver for PublicResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        _config: &UreqConfig,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let scheme = uri.scheme_str().unwrap_or("");
+        if scheme != "https" {
+            return Err(ureq::Error::BadUri(
+                "registration egress requires https".into(),
+            ));
+        }
+        let Some(authority) = uri.authority() else {
+            return Err(ureq::Error::BadUri("registration URL has no host".into()));
+        };
+        let port = authority.port_u16().unwrap_or(443);
+        let addresses = resolve_public_host(authority.host(), port)
+            .map_err(|message| ureq::Error::Io(std::io::Error::other(message)))?;
+        let mut result = self.empty();
+        for address in addresses.into_iter().take(16) {
+            result.push(address);
+        }
+        if result.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(result)
+    }
+}
+
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Validate one registration URL: HTTPS only, a real host, and no embedded
+/// credentials. Each redirect target passes through this before it is fetched.
+pub fn validate_registration_url(value: &str) -> Result<Url, ClientError> {
+    let url = Url::parse(value)
+        .map_err(|error| ClientError::Other(format!("invalid registration URL: {error}")))?;
+    if url.scheme() != "https" {
+        return Err(ClientError::Other(
+            "registration egress requires https".into(),
+        ));
+    }
+    if url.host_str().is_none() || url.host_str() == Some("") {
+        return Err(ClientError::Other("registration URL has no host".into()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ClientError::Other(
+            "registration URL must not contain credentials".into(),
+        ));
+    }
+    Ok(url)
+}
+
+/// Parse the IANA referral into a host or IP literal. Ports other than the
+/// WHOIS port are refused so a referral cannot turn into a port probe.
+fn whois_host(server: &str) -> Option<String> {
+    let mut text = server.trim();
+    if text.is_empty() || text.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("whois://") {
+        text = rest;
+    }
+    let text = text.split('/').next()?.trim_end_matches('.');
+    let bracketed = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'));
+    let text = bracketed.unwrap_or(text);
+    if text.parse::<IpAddr>().is_ok() {
+        return Some(text.to_string());
+    }
+    if text.contains(':') {
+        let (host, port) = text.rsplit_once(':')?;
+        if port != "43" || host.is_empty() {
+            return None;
+        }
+        return Some(host.to_string());
+    }
+    if text.len() > 253 || !text.contains('.') {
+        return None;
+    }
+    let labels: Vec<&str> = text.split('.').collect();
+    let valid = labels
+        .iter()
+        .all(|label| !label.is_empty() && label.len() <= 63)
+        && labels.iter().any(|label| label.len() >= 2)
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'));
+    valid.then(|| text.to_string())
+}
+
+const MAX_REGISTRATION_REDIRECTS: usize = 3;
+
 pub struct NetworkClient {
     agent: ureq::Agent,
     throttle: Mutex<Instant>,
@@ -796,13 +986,19 @@ pub struct NetworkClient {
 
 impl NetworkClient {
     pub fn new(request_delay: Duration, timeout: Duration) -> Self {
+        // Redirects are followed by hand so every hop is revalidated as HTTPS
+        // and re-resolved through PublicResolver at connection time.
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
-            .max_redirects(3)
+            .max_redirects(0)
             .http_status_as_error(false)
+            // Environment proxies would move the connection away from
+            // PublicResolver and bypass the public-address policy. Registration
+            // egress is direct by design.
+            .proxy(None)
             .build();
         NetworkClient {
-            agent: ureq::Agent::new_with_config(config),
+            agent: ureq::Agent::with_parts(config, DefaultConnector::default(), PublicResolver),
             throttle: Mutex::new(Instant::now() - request_delay),
             request_delay,
             timeout,
@@ -822,24 +1018,25 @@ impl NetworkClient {
         }
     }
 
-    fn request(
+    fn send_once(
         &self,
         method: &str,
         url: &str,
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
-    ) -> Result<(u16, Option<String>, String), ClientError> {
+    ) -> Result<(u16, Option<String>, Option<String>, String), ClientError> {
+        let url = validate_registration_url(url)?;
         self.throttle();
         let response = match method {
             "GET" => {
-                let mut request = self.agent.get(url);
+                let mut request = self.agent.get(url.as_str());
                 for (key, value) in headers {
                     request = request.header(*key, *value);
                 }
                 request.call()
             }
             "POST" => {
-                let mut request = self.agent.post(url);
+                let mut request = self.agent.post(url.as_str());
                 for (key, value) in headers {
                     request = request.header(*key, *value);
                 }
@@ -862,11 +1059,51 @@ impl NetworkClient {
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let text = response
             .body_mut()
             .read_to_string()
             .map_err(|error| ClientError::Other(error.to_string()))?;
-        Ok((status, retry_after, text))
+        Ok((status, retry_after, location, text))
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<(u16, Option<String>, String), ClientError> {
+        let mut current = validate_registration_url(url)?.to_string();
+        let mut redirects = 0usize;
+        loop {
+            let (status, retry_after, location, text) =
+                self.send_once(method, &current, headers, body)?;
+            if method != "GET" || !is_redirect(status) {
+                return Ok((status, retry_after, text));
+            }
+            if redirects >= MAX_REGISTRATION_REDIRECTS {
+                return Err(ClientError::Other(
+                    "registration lookup exceeded the redirect limit".into(),
+                ));
+            }
+            let Some(location) = location else {
+                return Err(ClientError::Other(
+                    "registration redirect had no Location header".into(),
+                ));
+            };
+            let base = Url::parse(&current)
+                .map_err(|error| ClientError::Other(format!("invalid redirect base: {error}")))?;
+            let next = base
+                .join(&location)
+                .map_err(|error| ClientError::Other(format!("invalid redirect target: {error}")))?;
+            current = validate_registration_url(next.as_str())?.to_string();
+            redirects += 1;
+        }
     }
 
     fn get_json_value(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value, ClientError> {
@@ -897,50 +1134,53 @@ impl RegistrationClient for NetworkClient {
 
     fn whois(&self, server: &str, query: &str) -> Result<String, ClientError> {
         self.throttle();
-        let address = format!("{server}:43");
-        let address = address
-            .to_socket_addrs_first()
-            .ok_or_else(|| ClientError::Connect("WHOIS server has no address".into()))?;
-        let mut stream = TcpStream::connect_timeout(&address, self.timeout)
-            .map_err(|error| ClientError::Connect(error.to_string()))?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(|error| ClientError::Connect(error.to_string()))?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(|error| ClientError::Connect(error.to_string()))?;
-        stream
-            .write_all(format!("{query}\r\n").as_bytes())
-            .map_err(|error| ClientError::Connect(error.to_string()))?;
-        let mut chunks = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    chunks.extend_from_slice(&buffer[..size]);
-                    if chunks.len() > 1024 * 1024 {
+        let server = whois_host(server)
+            .ok_or_else(|| ClientError::Connect("WHOIS server name is invalid".into()))?;
+        let addresses = resolve_public_host(&server, 43).map_err(ClientError::Connect)?;
+        let mut last_error = String::from("WHOIS server has no address");
+        for address in addresses {
+            let mut stream = match TcpStream::connect_timeout(&address, self.timeout) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    last_error = error.to_string();
+                    continue;
+                }
+            };
+            stream
+                .set_read_timeout(Some(self.timeout))
+                .map_err(|error| ClientError::Connect(error.to_string()))?;
+            stream
+                .set_write_timeout(Some(self.timeout))
+                .map_err(|error| ClientError::Connect(error.to_string()))?;
+            if let Err(error) = stream.write_all(format!("{query}\r\n").as_bytes()) {
+                last_error = error.to_string();
+                continue;
+            }
+            let mut chunks = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        chunks.extend_from_slice(&buffer[..size]);
+                        if chunks.len() > 1024 * 1024 {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Err(ClientError::Timeout)
+                    }
+                    Err(error) => {
+                        last_error = error.to_string();
                         break;
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Err(ClientError::Timeout)
-                }
-                Err(error) => return Err(ClientError::Connect(error.to_string())),
+            }
+            if !chunks.is_empty() {
+                return Ok(String::from_utf8_lossy(&chunks).to_string());
             }
         }
-        Ok(String::from_utf8_lossy(&chunks).to_string())
-    }
-}
-
-trait SocketAddrsExt {
-    fn to_socket_addrs_first(&self) -> Option<std::net::SocketAddr>;
-}
-
-impl SocketAddrsExt for String {
-    fn to_socket_addrs_first(&self) -> Option<std::net::SocketAddr> {
-        use std::net::ToSocketAddrs;
-        self.as_str().to_socket_addrs().ok()?.next()
+        Err(ClientError::Connect(last_error))
     }
 }
 

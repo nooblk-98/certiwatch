@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -269,13 +269,16 @@ impl SystemResolver {
         }
     }
 
-    fn exchange(&self, query: &[u8]) -> Result<Message, LookupFailure> {
+    fn exchange(&self, query: &Message) -> Result<Message, LookupFailure> {
+        let encoded = query
+            .to_bytes()
+            .map_err(|exc| LookupFailure::Unknown(format!("could not encode DNS query: {exc}")))?;
         let mut last_error = String::from("no resolver configured");
         for nameserver in &self.nameservers {
-            match self.exchange_udp(nameserver, query) {
+            match self.exchange_udp(nameserver, query, &encoded) {
                 Ok(message) => {
-                    if message.truncated() {
-                        match self.exchange_tcp(nameserver, query) {
+                    if message.metadata.truncation {
+                        match self.exchange_tcp(nameserver, query, &encoded) {
                             Ok(message) => return Ok(message),
                             Err(error) => last_error = error,
                         }
@@ -289,7 +292,12 @@ impl SystemResolver {
         Err(LookupFailure::Unknown(last_error))
     }
 
-    fn exchange_udp(&self, nameserver: &SocketAddr, query: &[u8]) -> Result<Message, String> {
+    fn exchange_udp(
+        &self,
+        nameserver: &SocketAddr,
+        query: &Message,
+        encoded: &[u8],
+    ) -> Result<Message, String> {
         let bind = if nameserver.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -297,19 +305,57 @@ impl SystemResolver {
         };
         let socket = UdpSocket::bind(bind).map_err(|exc| exc.to_string())?;
         socket
-            .set_read_timeout(Some(self.timeout))
-            .map_err(|exc| exc.to_string())?;
-        socket
             .set_write_timeout(Some(self.timeout))
             .map_err(|exc| exc.to_string())?;
         socket.connect(nameserver).map_err(|exc| exc.to_string())?;
-        socket.send(query).map_err(|exc| exc.to_string())?;
+        socket.send(encoded).map_err(|exc| exc.to_string())?;
+
+        // A connected UDP socket filters the source address, but an attacker on
+        // the path can still inject a packet. Ignore every reply that does not
+        // echo this exact query until the read deadline expires.
+        let deadline = Instant::now() + self.timeout;
         let mut buffer = [0u8; 4096];
-        let size = socket.recv(&mut buffer).map_err(|exc| exc.to_string())?;
-        Message::from_bytes(&buffer[..size]).map_err(|exc| exc.to_string())
+        let mut rejected = 0usize;
+        loop {
+            if rejected > 64 {
+                return Err("DNS response validation failed: too many mismatched replies".into());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("DNS response validation failed: no matching UDP reply".into());
+            }
+            socket
+                .set_read_timeout(Some(deadline - now))
+                .map_err(|exc| exc.to_string())?;
+            let size = match socket.recv(&mut buffer) {
+                Ok(size) => size,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err("DNS response validation failed: no matching UDP reply".into())
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let response = match Message::from_bytes(&buffer[..size]) {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            if validate_response(query, &response).is_ok() {
+                return Ok(response);
+            }
+            rejected += 1;
+        }
     }
 
-    fn exchange_tcp(&self, nameserver: &SocketAddr, query: &[u8]) -> Result<Message, String> {
+    fn exchange_tcp(
+        &self,
+        nameserver: &SocketAddr,
+        query: &Message,
+        encoded: &[u8],
+    ) -> Result<Message, String> {
         let mut stream =
             TcpStream::connect_timeout(nameserver, self.timeout).map_err(|exc| exc.to_string())?;
         stream
@@ -318,20 +364,54 @@ impl SystemResolver {
         stream
             .set_write_timeout(Some(self.timeout))
             .map_err(|exc| exc.to_string())?;
-        let length = (query.len() as u16).to_be_bytes();
+        let length = (encoded.len() as u16).to_be_bytes();
         stream.write_all(&length).map_err(|exc| exc.to_string())?;
-        stream.write_all(query).map_err(|exc| exc.to_string())?;
+        stream.write_all(encoded).map_err(|exc| exc.to_string())?;
         let mut header = [0u8; 2];
         stream
             .read_exact(&mut header)
             .map_err(|exc| exc.to_string())?;
         let size = u16::from_be_bytes(header) as usize;
+        if size < 12 {
+            return Err("DNS response validation failed: short TCP reply".into());
+        }
         let mut body = vec![0u8; size];
         stream
             .read_exact(&mut body)
             .map_err(|exc| exc.to_string())?;
-        Message::from_bytes(&body).map_err(|exc| exc.to_string())
+        let response = Message::from_bytes(&body).map_err(|exc| exc.to_string())?;
+        validate_response(query, &response)?;
+        Ok(response)
     }
+}
+
+/// Reject a datagram or stream record unless it is the response to this exact
+/// query: same ID, QR=response, same opcode, and the same single question.
+///
+/// This runs before the caller reads the answer section or the AD bit, so an
+/// off-path packet cannot contribute records or a forged DNSSEC verdict.
+pub fn validate_response(query: &Message, response: &Message) -> Result<(), String> {
+    if response.metadata.id != query.metadata.id {
+        return Err("DNS response validation failed: transaction ID mismatch".into());
+    }
+    if response.metadata.message_type != MessageType::Response {
+        return Err("DNS response validation failed: message is not a response".into());
+    }
+    if response.metadata.op_code != query.metadata.op_code {
+        return Err("DNS response validation failed: opcode mismatch".into());
+    }
+    if query.queries.len() != 1 || response.queries.len() != 1 {
+        return Err("DNS response validation failed: question count mismatch".into());
+    }
+    let expected = &query.queries[0];
+    let actual = &response.queries[0];
+    if expected.name() != actual.name()
+        || expected.query_type() != actual.query_type()
+        || expected.query_class() != actual.query_class()
+    {
+        return Err("DNS response validation failed: question mismatch".into());
+    }
+    Ok(())
 }
 
 impl Resolver for SystemResolver {
@@ -346,22 +426,19 @@ impl Resolver for SystemResolver {
         let domain = Name::from_ascii(&fqdn)
             .map_err(|exc| LookupFailure::Unknown(format!("invalid DNS name: {exc}")))?;
 
-        let mut message = Message::new();
-        message
-            .set_id(NEXT_ID.fetch_add(1, Ordering::Relaxed))
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query)
-            .set_recursion_desired(true)
-            .add_query(Query::query(domain, record_type));
+        let mut message = Message::new(
+            NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            MessageType::Query,
+            OpCode::Query,
+        );
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(domain, record_type));
         let mut edns = Edns::new();
         edns.set_dnssec_ok(true);
-        message.extensions_mut().replace(edns);
-        let query = message
-            .to_bytes()
-            .map_err(|exc| LookupFailure::Unknown(format!("could not encode DNS query: {exc}")))?;
+        message.edns = Some(edns);
 
-        let response = self.exchange(&query)?;
-        match response.response_code() {
+        let response = self.exchange(&message)?;
+        match response.metadata.response_code {
             ResponseCode::NoError => {}
             ResponseCode::NXDomain => return Err(LookupFailure::Absent(Some("NXDOMAIN".into()))),
             other => {
@@ -371,19 +448,19 @@ impl Resolver for SystemResolver {
 
         let mut records = Vec::new();
         let mut rrsig_count = 0;
-        for record in response.answers() {
+        for record in &response.answers {
             if record.record_type() == RecordType::RRSIG {
                 rrsig_count += 1;
             }
             if record.record_type() != record_type {
                 continue;
             }
-            match record.data() {
+            match &record.data {
                 RData::NS(ns) => records.push(RecordData::Ns(ns.to_string())),
                 RData::CAA(caa) => records.push(RecordData::Caa {
                     flags: caa.flags(),
-                    tag: caa.tag().as_str().to_string(),
-                    value: String::from_utf8_lossy(caa.raw_value()).to_string(),
+                    tag: caa.tag.clone(),
+                    value: String::from_utf8_lossy(&caa.value).to_string(),
                 }),
                 RData::DNSSEC(hickory_proto::dnssec::rdata::DNSSECRData::DNSKEY(key)) => {
                     records.push(RecordData::Dnskey(key.to_string()))
@@ -396,7 +473,7 @@ impl Resolver for SystemResolver {
             return Err(LookupFailure::Absent(None));
         }
         Ok(LookupAnswer {
-            ad: response.authentic_data(),
+            ad: response.metadata.authentic_data,
             records,
             rrsig_count,
         })

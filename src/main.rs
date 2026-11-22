@@ -223,10 +223,12 @@ async fn check(config: Option<PathBuf>, data_dir: Option<PathBuf>) -> i32 {
         serde_json::to_string_pretty(&summary.to_json()).unwrap_or_default()
     );
     if summary.ok {
-        if summary.error.is_some() {
+        if summary.delivery_error.is_some() || summary.deadline_exceeded {
             return 2;
         }
         0
+    } else if summary.published {
+        2
     } else {
         1
     }

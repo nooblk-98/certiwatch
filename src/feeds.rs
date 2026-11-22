@@ -418,11 +418,46 @@ pub fn registration_bucket(status: &str) -> &'static str {
     }
 }
 
-fn domain_status(certificate: Option<&SslRow>, registration: Option<&RegistrationRow>) -> String {
-    domain_status_from_categories(
-        certificate.map(|row| row.category.as_str()),
-        registration.map(|row| row.category.as_str()),
-    )
+/// A check that is not configured for this deployment is ignored; a check that
+/// is configured but produced no row for this domain is a warning.
+fn domain_status_scoped(
+    certificate: Option<&SslRow>,
+    registration: Option<&RegistrationRow>,
+    certificate_checked: bool,
+    registration_checked: bool,
+) -> String {
+    let mut categories: Vec<&str> = Vec::new();
+    if let Some(certificate) = certificate {
+        categories.push(certificate.category.as_str());
+    }
+    if let Some(registration) = registration {
+        categories.push(registration.category.as_str());
+    }
+    if categories
+        .iter()
+        .any(|category| matches!(*category, "expired" | "today" | "invalid"))
+    {
+        return "critical".into();
+    }
+    if certificate_checked && certificate.is_none() {
+        return "warning".into();
+    }
+    if registration_checked && registration.is_none() {
+        return "warning".into();
+    }
+    if !certificate_checked && !registration_checked {
+        return "unknown".into();
+    }
+    if categories.iter().all(|category| *category == "unknown") {
+        return "unknown".into();
+    }
+    if categories
+        .iter()
+        .any(|category| !matches!(*category, "valid" | "active"))
+    {
+        return "warning".into();
+    }
+    "ok".into()
 }
 
 /// Aggregate one domain from already-classified check categories.
@@ -920,15 +955,9 @@ fn load_result(source: &Path, name: &str) -> Result<Value, FeedError> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| FeedError::new(format!("{name}: missing or empty 'generated_at'")))?;
     parse_timestamp(generated_at, &format!("{name}: generated_at"))?;
-    let results = data
-        .get("results")
+    data.get("results")
         .and_then(Value::as_array)
         .ok_or_else(|| FeedError::new(format!("{name}: missing 'results' list")))?;
-    if results.is_empty() {
-        return Err(FeedError::new(format!(
-            "{name}: 'results' is empty, refusing to publish empty feeds"
-        )));
-    }
     Ok(data)
 }
 
@@ -958,9 +987,9 @@ pub fn build_feeds(
         .get("results")
         .and_then(Value::as_array)
         .ok_or_else(|| FeedError::new("domain_results.json: missing 'results' list"))?;
-    if ssl_results.is_empty() || domain_results.is_empty() {
+    if ssl_results.is_empty() && domain_results.is_empty() {
         return Err(FeedError::new(
-            "refusing to publish empty feeds: both result files need rows",
+            "refusing to publish empty feeds: at least one result file needs rows",
         ));
     }
 
@@ -989,7 +1018,12 @@ pub fn build_feeds(
     for domain in &domains {
         let certificate = certificates.get(domain);
         let registration = registrations.get(domain);
-        let status = domain_status(certificate, registration);
+        let status = domain_status_scoped(
+            certificate,
+            registration,
+            !certificates.is_empty(),
+            !registrations.is_empty(),
+        );
         let filename = badge_filename(domain);
         if let Some(existing) = seen_files.get(&filename) {
             if existing != domain {

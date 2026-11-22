@@ -129,7 +129,7 @@ deterministic units. The recording is tied to base commit `d2d8347` and retained
 | --- | --- |
 | Cloudflare KV checkpoint | Replaced by durable local state; no KV equivalent. |
 | Deployment | The container is self-hosted. A release workflow publishes images to GHCR. |
-| Registration-only config | Runs without SSL targets and keeps previous feeds; legacy required an SSL target. |
+| Single-check config | Certificate-only or registration-only deployments build feeds from the checks they have; legacy required both result sets. |
 | Live DNS/RDAP/WHOIS/.lk/Discord | Not probed here; logic is offline-tested. |
 | `.lk` spacing | Shares the global 0.35 s RDAP/WHOIS throttle; slightly slower, no correctness effect. |
 | `validate_conf.py` legacy `.conf` repair | Not ported; `certiwatch validate` validates TOML only. |

@@ -35,7 +35,8 @@ certiwatch serve
   │                 3. coverage gate (a run that read no certificate cannot publish)
   │                 4. history + private alert state
   │                 5. feeds built in memory
-  │                 6. atomic publish to /data/public, checkpoint /data/private
+  │                 6. atomic commit of one generation: public files plus the
+  │                    initial private alert checkpoint
   │                 7. optional Discord delivery (state persisted before send)
   └─ Axum HTTP
         GET /                  server-rendered dashboard (filters are GET forms)
@@ -164,13 +165,13 @@ picked up on the next run without a restart. It never writes to the file.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CERTIWATCH_CONFIG` | `./certiwatch.toml` | Configuration path |
-| `CERTIWATCH_DATA_DIR` | `./data` | Persistent `public/` + `private/` root |
+| `CERTIWATCH_DATA_DIR` | `./data` | Persistent generation store and run state |
 | `CERTIWATCH_LISTEN` | `0.0.0.0:8080` | HTTP listen address |
 | `CERTIWATCH_REFRESH_INTERVAL` | `3600` | Seconds between scheduled runs |
 | `CERTIWATCH_RUN_ON_START` | `1` | Run once at startup (`0`/`false` disables) |
 | `CERTIWATCH_RUN_TIMEOUT` | `900` | Overall run deadline, seconds |
 | `CERTIWATCH_MAX_CONCURRENCY` | `4` | Parallel checks per run |
-| `SSL_CHECK_TIMEOUT` | `15` | Per-connection timeout, seconds |
+| `SSL_CHECK_TIMEOUT` | `15` | Per-connection timeout in seconds; finite positive values up to 86400, otherwise the default |
 | `SSL_CA_FILE` | unset | Extra CA bundle for private CAs |
 | `CERTIWATCH_DISCORD_WEBHOOK` | unset | Discord webhook; never logged or stored |
 
@@ -195,20 +196,33 @@ It does not create releases, deploy the service, or push `latest`. Repository
 
 ```
 /data
-├── public/                    # served; safe to back up
-│   ├── ssl_results.json
-│   ├── domain_results.json
-│   ├── history.json
-│   ├── status.json
-│   ├── expiries.ics
-│   └── badges/
-└── private/                   # 0700; never served
-    ├── alert_state.json       # durable Discord batch/checkpoint
-    └── last_run.json
+├── current.json               # convenience pointer; records are authoritative
+├── commits/
+│   └── <id>.json              # durable commit evidence for each generation
+├── generations/
+│   └── <id>/
+│       ├── public/            # served; safe to back up
+│       │   ├── ssl_results.json
+│       │   ├── domain_results.json
+│       │   ├── history.json
+│       │   ├── status.json
+│       │   ├── expiries.ics
+│       │   └── badges/
+│       ├── private/           # 0700; never served
+│       │   └── alert_state.json
+│       └── .complete.json     # manifest of the committed generation
+├── public/                    # legacy tree, copied into a generation once
+└── private/last_run.json      # latest run summary
 ```
 
-Back up the whole volume; `private/` is what prevents duplicate alerts after a
-restart. Snapshot example:
+Back up the whole volume; the committed `generations/` directories,
+`commits/` records and `current.json` are what prevent duplicate alerts after a
+restart. Recovery fails closed on incomplete record I/O, while readable
+invalid records suppress migration and allow fallback to an older verified
+generation. Record IDs come only from strict filenames and must match the
+payload. Retention counts only recovery-eligible generations, protects the
+current one, and preserves unknown or unverifiable evidence; records are
+removed only after a generation directory is removed. Snapshot example:
 
 ```bash
 docker run --rm -v certiwatch-data:/data -v "$PWD/backup:/backup" \
@@ -221,7 +235,8 @@ single writer: run exactly one CertiWatch container against a volume.
 ## Operations
 
 - **Health:** `/healthz` proves the process is up. `/readyz` is `200` only after
-  a public snapshot exists, `503` with `Retry-After: 30` before that.
+  a complete, coherent generation is committed, `503` with `Retry-After: 30`
+  before that. See [publication and egress hardening](docs/security-hardening.md).
 - **Refresh:** scheduled every `CERTIWATCH_REFRESH_INTERVAL` seconds, plus one
   startup run unless disabled. There is no HTTP refresh endpoint.
 - **Logs:** one line per run (trigger, row counts, events, duration, whether the
@@ -231,7 +246,9 @@ single writer: run exactly one CertiWatch container against a volume.
 - **Upgrade:** `docker compose build --pull && docker compose up -d`. The volume
   and config are untouched.
 - **Rollback:** start the previous image tag against the same volume and config.
-  Public files are replaced atomically, so a rollback never needs a migration.
+  Generations are committed atomically, but an image older than this layout
+  reads only the legacy `public/` tree, so back up the volume before downgrading
+  across the layout change.
 - **Failure:** a run that cannot read any certificate, or cannot build a feed,
   does not publish. The dashboard keeps showing the last good snapshot and marks
   stale data after 36 hours.

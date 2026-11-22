@@ -888,8 +888,13 @@ pub fn prepare_monitoring(
     })
 }
 
-/// Clear delivered events, or retain them for the next run.
-pub fn finalize_alert_state(alert_state: &Value, events: &[Value], delivered: bool) -> Value {
+/// Advance observations and either retain pending events for delivery/retry or
+/// clear them when no delivery path exists.
+pub fn finalize_alert_state_pending(
+    alert_state: &Value,
+    events: &[Value],
+    retain_pending: bool,
+) -> Value {
     let mut map = Map::new();
     map.insert("version".into(), json!(STATE_VERSION));
     map.insert(
@@ -908,13 +913,18 @@ pub fn finalize_alert_state(alert_state: &Value, events: &[Value], delivered: bo
     );
     map.insert(
         "pending_events".into(),
-        if delivered {
-            json!([])
-        } else {
+        if retain_pending {
             Value::Array(events.to_vec())
+        } else {
+            json!([])
         },
     );
     Value::Object(map)
+}
+
+/// Clear delivered events, or retain them for the next run.
+pub fn finalize_alert_state(alert_state: &Value, events: &[Value], delivered: bool) -> Value {
+    finalize_alert_state_pending(alert_state, events, !delivered)
 }
 
 // ── TLS coverage gate ────────────────────────────────────────────────────────
