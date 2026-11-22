@@ -110,11 +110,34 @@ fn published_file(state: &AppState, relative: &Path, content_type: &str, cache: 
 
 // ── Dashboard ────────────────────────────────────────────────────────────────
 
-async fn dashboard_page(State(state): State<Arc<AppState>>, RawQuery(query): RawQuery) -> Response {
-    let query = query
+fn theme_from_cookie(headers: &header::HeaderMap) -> String {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().strip_prefix("cw_theme="))
+        .find(|value| matches!(*value, "light" | "dark"))
+        .unwrap_or("dark")
+        .to_string()
+}
+
+async fn dashboard_page(
+    State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
+    request_headers: header::HeaderMap,
+) -> Response {
+    let mut query = query
         .as_deref()
         .and_then(|raw| serde_urlencoded::from_str::<DashboardQuery>(raw).ok())
         .unwrap_or_default();
+    // Theme: an explicit ?theme= wins and is remembered in a cookie; otherwise the cookie; otherwise dark.
+    let requested = matches!(query.theme.as_str(), "light" | "dark").then(|| query.theme.clone());
+    if let Some(theme) = &requested {
+        query.theme = theme.clone();
+    } else {
+        query.theme = theme_from_cookie(&request_headers);
+    }
     let snapshot = state.service.read_snapshot();
     let html = dashboard::render_dashboard(
         snapshot.ssl.as_ref(),
@@ -129,6 +152,11 @@ async fn dashboard_page(State(state): State<Arc<AppState>>, RawQuery(query): Raw
         "text/html; charset=utf-8".parse().unwrap(),
     );
     headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+    headers.insert(header::VARY, "Cookie".parse().unwrap());
+    if let Some(theme) = requested {
+        let cookie = format!("cw_theme={theme}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly");
+        headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    }
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         DASHBOARD_CSP.parse().unwrap(),
