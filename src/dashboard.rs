@@ -2364,6 +2364,12 @@ impl Page {
             && self.q.healthy != "1"
             && !wants_healthy_row;
         let mut current: Option<u8> = None;
+        // Keep each urgency group contiguous: unreachable targets belong to "Act now".
+        let mut ordered: Vec<&Row> = rows.to_vec();
+        if grouped {
+            ordered.sort_by_key(|row| row_group(row.cat).0);
+        }
+        let rows = ordered.as_slice();
         for (index, row) in rows.iter().enumerate() {
             if grouped && has_problem {
                 let (rank, label) = row_group(row.cat);
