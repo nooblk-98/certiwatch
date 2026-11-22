@@ -3,16 +3,15 @@
 
 :root {
   color-scheme: light dark;
-  --page: #f8f8f6;
+  --page: #f1f4f8;
   --card: #ffffff;
-  --soft: #f1f1ef;
-  --side: #f3f3f1;
-  --ink: #17171a;
-  --ink-2: #48484d;
-  --muted: #66666d;
+  --soft: #edf1f6;
+  --ink: #182336;
+  --ink-2: #40506a;
+  --muted: #52617a;
   --line: rgb(0 0 0 / 0.075);
   --line-strong: rgb(0 0 0 / 0.14);
-  --accent: #3e63dd;
+  --accent: #284eba;
   --on-accent: #ffffff;
   --live: #12a150;
   --ok-ink: #0f7f57;
@@ -20,7 +19,6 @@
   --warn-ink: #7a5300;
   --bad: #d23f45;
   --bad-ink: #b3262c;
-  --tip: #1f2530;
   --shadow-card: 0 1px 2px rgb(0 0 0 / 0.04), 0 1px 1px rgb(0 0 0 / 0.02);
   --shadow-pop: 0 12px 32px -8px rgb(0 0 0 / 0.18), 0 0 0 1px rgb(0 0 0 / 0.06);
   --radius: 16px;
@@ -30,48 +28,44 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --page: #0b0b0d;
-    --card: #141417;
-    --soft: #1c1c20;
-    --side: #101013;
-    --ink: #f3f3f5;
-    --ink-2: #c4c4ca;
-    --muted: #8c8c95;
+    --page: #0e1623;
+    --card: #172233;
+    --soft: #202e43;
+    --ink: #edf2fc;
+    --ink-2: #c1cde0;
+    --muted: #a6b5cb;
     --line: rgb(255 255 255 / 0.08);
     --line-strong: rgb(255 255 255 / 0.16);
-    --accent: #7b96ff;
-    --on-accent: #0b0b0d;
+    --accent: #a1b7ff;
+    --on-accent: #0e1623;
     --live: #34c48b;
     --ok-ink: #34c48b;
     --warn: #f6b100;
     --warn-ink: #f6b100;
     --bad: #ff6b70;
     --bad-ink: #ff8a8e;
-    --tip: #2a3548;
     --shadow-card: 0 1px 2px rgb(0 0 0 / 0.4);
     --shadow-pop: 0 12px 32px -8px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.08);
   }
 }
 
 :root[data-theme="dark"] {
-  --page: #0b0b0d;
-  --card: #141417;
-  --soft: #1c1c20;
-  --side: #101013;
-  --ink: #f3f3f5;
-  --ink-2: #c4c4ca;
-  --muted: #8c8c95;
+  --page: #0e1623;
+  --card: #172233;
+  --soft: #202e43;
+  --ink: #edf2fc;
+  --ink-2: #c1cde0;
+  --muted: #a6b5cb;
   --line: rgb(255 255 255 / 0.08);
   --line-strong: rgb(255 255 255 / 0.16);
-  --accent: #7b96ff;
-  --on-accent: #0b0b0d;
+  --accent: #a1b7ff;
+  --on-accent: #0e1623;
   --live: #34c48b;
   --ok-ink: #34c48b;
   --warn: #f6b100;
   --warn-ink: #f6b100;
   --bad: #ff6b70;
   --bad-ink: #ff8a8e;
-  --tip: #2a3548;
   --shadow-card: 0 1px 2px rgb(0 0 0 / 0.4);
   --shadow-pop: 0 12px 32px -8px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.08);
 }
@@ -119,6 +113,10 @@ a:hover {
   border-radius: 4px;
 }
 
+#main:focus {
+  outline: none;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -162,9 +160,8 @@ a:hover {
   position: sticky;
   top: 0;
   z-index: 20;
-  background: color-mix(in srgb, var(--page) 94%, transparent);
+  background: var(--card);
   border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(8px);
 }
 
 .top-inner {
@@ -182,8 +179,11 @@ a:hover {
 }
 
 .brand-mark {
-  width: 22px;
-  height: 22px;
+  width: 32px;
+  height: 32px;
+  padding: 5px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--card));
   color: var(--accent);
   fill: none;
   stroke: currentColor;
@@ -195,14 +195,8 @@ a:hover {
 
 .brand-name {
   font-weight: 600;
-  font-size: 15px;
-  letter-spacing: -0.01em;
-}
-
-.brand-sub {
-  color: var(--muted);
-  font-size: 12px;
-  padding-left: 2px;
+  font-size: 17px;
+  letter-spacing: -0.02em;
 }
 
 .tabs {
@@ -308,8 +302,38 @@ a:hover {
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 .main {
-  padding-top: 24px;
+  padding-top: 28px;
   padding-bottom: 40px;
+}
+
+.page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  margin-bottom: 20px;
+}
+
+.page-head h1 {
+  margin: 0;
+  font-size: clamp(23px, 3vw, 36px);
+  line-height: 1.15;
+  letter-spacing: -0.035em;
+}
+
+.inventory-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#main,
+#inventory {
+  scroll-margin-top: 76px;
 }
 
 .note {
@@ -397,11 +421,11 @@ a:hover {
 .kpi-value {
   grid-area: value;
   margin: 0;
-  font-size: 28px;
+  font-size: 30px;
   line-height: 1.05;
   font-weight: 600;
   letter-spacing: -0.02em;
-  font-variant-numeric: proportional-nums;
+  font-variant-numeric: tabular-nums;
 }
 
 .kpi-base {
@@ -468,9 +492,9 @@ a:hover {
 
 .card-head h2 {
   margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
 }
 
 .card-fact {
@@ -482,6 +506,12 @@ a:hover {
 }
 
 /* ── Attention ───────────────────────────────────────────────────────────── */
+
+.attention .card-fact {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--soft);
+}
 
 .attn-list {
   list-style: none;
@@ -497,8 +527,8 @@ a:hover {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 38px;
-  padding: 4px 2px;
+  min-height: 40px;
+  padding: 5px 6px;
   color: var(--ink);
 }
 
@@ -510,23 +540,29 @@ a:hover {
 .attn-domain {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 500;
+  overflow-wrap: anywhere;
+  font-weight: 600;
 }
 
 .attn-days {
+  min-width: 5ch;
+  text-align: right;
   color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
+.attn-arrow {
+  color: var(--accent);
+  font-size: 16px;
+}
+
 .more-link {
   display: inline-block;
-  margin-top: 10px;
-  font-size: 12px;
+  margin-top: 12px;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .empty-state {
@@ -703,6 +739,11 @@ a:hover {
 
 .list-card {
   padding-bottom: 10px;
+  margin-bottom: 16px;
+}
+
+.list-card .card-fact {
+  white-space: normal;
 }
 
 .filters {
@@ -1015,12 +1056,12 @@ a.domain:hover {
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
-  height: 24px;
+  min-height: 26px;
   padding: 0 10px;
   list-style: none;
   cursor: pointer;
-  color: var(--muted);
-  font-size: 11px;
+  color: var(--accent);
+  font-size: 12px;
   user-select: none;
 }
 
@@ -1030,16 +1071,6 @@ a.domain:hover {
 
 .detail-row summary:hover {
   color: var(--ink);
-}
-
-.summary-word {
-  opacity: 0;
-}
-
-.detail-row summary:hover .summary-word,
-.detail-row summary:focus-visible .summary-word,
-.detail-row details[open] .summary-word {
-  opacity: 1;
 }
 
 .chev {
@@ -1461,32 +1492,24 @@ code {
 
   .top {
     position: static;
-    backdrop-filter: none;
   }
 
   .top-inner {
     flex-wrap: wrap;
     gap: 8px 12px;
-    padding: 10px 0;
+    padding-block: 10px;
   }
 
   .brand {
     flex: 1;
   }
 
-  .brand-sub {
-    display: none;
-  }
-
   .toolbar {
-    order: 3;
-    width: 100%;
-    margin-left: 0;
-    justify-content: space-between;
+    margin-left: auto;
   }
 
   .tabs {
-    order: 4;
+    order: 3;
     width: 100%;
   }
 
@@ -1497,7 +1520,26 @@ code {
   }
 
   .main {
-    padding-top: 16px;
+    padding-top: 14px;
+  }
+
+  .page-head {
+    gap: 0 12px;
+    margin-bottom: 12px;
+  }
+
+  .page-head h1 {
+    font-size: 21px;
+  }
+
+  .tab,
+  .pill {
+    min-height: 36px;
+  }
+
+  .history-data > summary {
+    min-height: 40px;
+    line-height: 40px;
   }
 
   .kpi {
@@ -1518,13 +1560,21 @@ code {
   }
 
   .filters {
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     align-items: stretch;
-    gap: 8px;
+    gap: 10px;
   }
 
-  .field-grow {
-    flex: none;
+  .field-grow,
+  .field-actions {
+    grid-column: 1 / -1;
+  }
+
+  .field input,
+  .field select {
+    height: 40px;
+    font-size: 16px;
   }
 
   .field select {
@@ -1532,9 +1582,15 @@ code {
     width: 100%;
   }
 
-  .field-actions {
-    justify-content: space-between;
+  .field-actions .button {
+    min-height: 40px;
   }
+
+  #main,
+  #inventory {
+    scroll-margin-top: 12px;
+  }
+
 
   /* Rows fold into cards: names and numbers stay whole, decorations go. */
   .table-scroll {
@@ -1661,12 +1717,8 @@ code {
   }
 
   .detail-row details > summary {
-    height: 32px;
+    min-height: 40px;
     justify-content: flex-start;
-  }
-
-  .summary-word {
-    opacity: 1;
   }
 
   .detail-grid {
@@ -1697,6 +1749,10 @@ code {
 }
 
 @media (max-width: 339px) {
+  .attn-link {
+    gap: 5px;
+  }
+
   .kpis {
     grid-template-columns: minmax(0, 1fr);
   }

@@ -61,11 +61,11 @@ directly below, above the table.
 | Context for every number | Each tile names its band; the list says "Showing X of Y · most urgent first"; history names the peak and the previous checks. |
 | Numbers | Tabular figures in tables, counts and axes; `—` for no data; dates as "18 Nov 2026"; percentages under 1% read `<1%`. |
 | Say it once | Counts are computed once per block and reused; the KPI partition does not repeat the total inside every tile; the history table repeats chart values only as the accessible copy. |
-| Density scale | 14 px base, 13 px tables/sub-lines, 12 px labels, 28 px KPI values, 16 px icons, 1.2 px strokes, medium weights. |
+| Density scale | 14 px base, 13 px tables/sub-lines, 12 px labels, 30 px KPI values, 16 px icons, 1.2 px strokes, medium weights. |
 | Tokens before components | `src/dashboard.css` defines every colour once for light and dark (system scheme plus `data-theme`), with tints as token + alpha. |
 | Layout grows with the screen | 2/3/6 KPI columns; main and lower panels go 1 → 7/5 at 900 px; content caps at 1240 px and reaches 1640 px from 1800 px. |
 | No holes | Cards align at the top rather than stretching a short card; the timeline and attention cards hold comparable content. |
-| Phones | 375 px: no page scroll, one column, rows fold into labelled blocks, the table header becomes visually hidden, filters stack, the sticky header is disabled, controls remain 30–36 px tall. |
+| Phones | 375 px: no horizontal page scroll, one column, rows fold into labelled blocks, the table header becomes visually hidden, search spans two filter columns, the sticky header is disabled, form inputs and detail toggles are at least 40 px tall. |
 | States | Setup (both files absent), per-check unavailable, empty result, no search matches, stale (>36 h), future timestamp, row checks older than 36 h, skipped rows, history missing/invalid/empty. |
 | QA | Known totals from an independent script, words audit, salience test, screenshots at 375 / 768 / 1024 / 1440 / 1800 / 3440, light and dark, keyboard and contrast checks. |
 
