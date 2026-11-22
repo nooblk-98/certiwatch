@@ -91,7 +91,7 @@ docker run -d --name certiwatch \
 
 The repository includes a ready-to-use [`compose.yaml`](compose.yaml). Deploy it
 as a stack or run `docker compose up -d`. Set `CERTIWATCH_PORT` to change the
-port and `CERTIWATCH_TAG` to pin a version, for example `2.1.0`.
+port and `CERTIWATCH_TAG` to pin a version, for example `2.2.0`.
 
 To use your own targets with Compose, uncomment the `certiwatch.toml` volume in
 `compose.yaml` and point it at an **absolute** path on the host.
