@@ -1,52 +1,24 @@
-# Python cache and bytecode
-__pycache__/
-*.py[cod]
-*$py.class
+# Rust build output
+/target/
 
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Build and packaging outputs
-build/
-dist/
-dist.staging/
-/.dist.staging-*/
-/.dist.previous-*/
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-
-# Generated check results: produced by the scripts, published from dist/,
-# never committed. Regenerate locally or let CI do it.
+# Local runtime data: generated public files and private alert state
+/data/
+/feeds/
 /ssl_results.json
 /domain_results.json
-
-# Monitoring lifecycle state. history.json is public but regenerated from the
-# result files; alert state is private and must never be committed or published.
 /history.json
-/.certiwatch/
-/feeds/
+/status.json
+/expiries.ics
 
-# Cloudflare Pages/Wrangler local state
-.wrangler/
-
-# Environment and local secrets
+# Local secrets and environment
 .env
 .env.*
 *.pem
 *.key
 
-# Local assistant/tooling state
-.claude/
-
-# Editor/IDE
+# Editor and OS junk
 .vscode/
 .idea/
-
-# OS junk
 .DS_Store
 Thumbs.db
 

@@ -1,0 +1,41 @@
+# CertiWatch single-container deployment.
+#
+# certiwatch.toml is the only configuration and is mounted read-only.
+# Data lives in the named volume; the container root filesystem is read-only.
+
+services:
+  certiwatch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: certiwatch:local
+    restart: unless-stopped
+    ports:
+      - "${CERTIWATCH_PORT:-8080}:8080"
+    environment:
+      CERTIWATCH_CONFIG: /config/certiwatch.toml
+      CERTIWATCH_DATA_DIR: /data
+      CERTIWATCH_LISTEN: 0.0.0.0:8080
+      CERTIWATCH_REFRESH_INTERVAL: "${CERTIWATCH_REFRESH_INTERVAL:-3600}"
+      CERTIWATCH_RUN_ON_START: "${CERTIWATCH_RUN_ON_START:-1}"
+      CERTIWATCH_DISCORD_WEBHOOK: "${CERTIWATCH_DISCORD_WEBHOOK:-}"
+    volumes:
+      - ./certiwatch.toml:/config/certiwatch.toml:ro
+      - certiwatch-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 30s
+
+volumes:
+  certiwatch-data:
