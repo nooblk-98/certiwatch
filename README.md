@@ -1,319 +1,192 @@
+<div align="center">
+
 # CertiWatch
 
-Certificate and domain-expiry monitoring as **one Rust service**. CertiWatch
-ships as a single binary and a single Docker Compose container: it runs the
-checks on a built-in schedule, keeps history and alert state on a persistent
-volume, and serves a server-rendered dashboard plus read-only JSON, badge and
-calendar feeds.
+**Never be surprised by an expired certificate or domain again.**
 
-Configure targets in `certiwatch.toml` and open the read-only dashboard.
+Self-hosted monitoring for TLS certificates and domain registrations, with a
+clear dashboard, a renewal calendar and optional Discord alerts. One small
+container, no database, no accounts.
 
-![CertiWatch Command Center dashboard (dark theme)](docs/dashboard.png)
+[Quick start](#quick-start) · [Features](#features) · [Configuration](#configuration) · [Alerts](#alerts) · [FAQ](#faq)
 
-*Command Center dashboard, dark theme (default): status banner, KPI row, urgency-sorted certificate table with expandable details, expiry radar, needs-attention list and issuers. A Dark/Light switch in the header remembers your choice in a cookie.*
+</div>
 
-![CertiWatch Command Center dashboard (light theme)](docs/dashboard-light.png)
+![CertiWatch dashboard, dark theme](docs/dashboard.png)
 
-*Light theme, using the bundled default targets.*
+<details>
+<summary>Light theme</summary>
 
-## What it does
+![CertiWatch dashboard, light theme](docs/dashboard-light.png)
 
-- Checks TLS certificates directly or through SMTP/IMAP/POP3 STARTTLS: trust
-  chain, hostname/SAN match, expiry, key strength, TLS version and cipher.
-- Checks domain registration through RDAP, the IANA bootstrap and WHOIS,
-  including the `.lk` registry API.
-- Optionally reports DNS (NS/CAA/DNSSEC), HSTS, and legacy TLS 1.0/1.1
-  capability.
-- Merges each run into a public history, derives alert events, and can deliver
-  them to one Discord webhook.
-- Publishes all files atomically: a failed or partial run keeps the previous
-  snapshot visible.
+</details>
 
-## Architecture
+*Screenshots use sample data.*
 
-```
-certiwatch serve
-  ├─ scheduler ── refresh pipeline
-  │                 1. read + validate certiwatch.toml (read-only)
-  │                 2. TLS checks + registration checks (bounded concurrency)
-  │                 3. coverage gate (a run that read no certificate cannot publish)
-  │                 4. history + private alert state
-  │                 5. feeds built in memory
-  │                 6. atomic commit of one generation: public files plus the
-  │                    initial private alert checkpoint
-  │                 7. optional Discord delivery (state persisted before send)
-  └─ Axum HTTP
-        GET /                  server-rendered dashboard (filters are GET forms)
-        GET /dashboard.css     the embedded stylesheet
-        GET /healthz /readyz   liveness / snapshot-readiness probes
-        GET /ssl_results.json  latest certificate results
-        GET /domain_results.json
-        GET /history.json
-        GET /status.json       summary feed
-        GET /expiries.ics      renewal calendar
-        GET /badges/*          SVG badges + manifest
-```
+## Why CertiWatch
 
-The HTTP surface is read-only. Refreshes happen on the schedule or through the
-`certiwatch check` CLI; nothing in the running server can be triggered remotely.
+Expiry problems are quiet until they are an outage. CertiWatch checks your
+sites on a schedule, shows what needs action first, and stays calm when
+everything is healthy.
 
-## Quick start: Docker Compose
+- **See the problem at a glance.** A status banner reads `ALL CLEAR`, `WARNING` or `CRITICAL`, and the table lists what to fix first.
+- **Know what is coming.** An expiry radar and a 30-day calendar show what renews when.
+- **Light on resources.** A single Rust binary in one container with a persistent volume. Nothing else to run.
+- **Private by design.** Self-hosted, read-only dashboard, no scripts in your browser.
 
-Requirements: Docker with Compose v2.
+## Features
+
+**Certificate monitoring**
+- Expiry countdown with thresholds at 30, 14, 7 and 1 days (configurable)
+- Trust chain, hostname/SAN match, key type and size, TLS version and cipher
+- Direct TLS and STARTTLS (SMTP, IMAP, POP3) so mail servers are covered too
+- Optional HSTS, legacy TLS 1.0/1.1 and DNS checks (NS, CAA, DNSSEC)
+
+**Domain monitoring**
+- Registration expiry through RDAP and WHOIS, including `.lk` domains
+
+**Dashboard**
+- Targets grouped by urgency: *Act now*, *This month*, *Healthy*
+- Search, status filters, group and tag filters, sortable columns
+- Click any row for full certificate details
+- Dark and light themes with a one-click switch (your choice is remembered)
+- Works on phones and tablets
+
+**Alerts and integrations**
+- Discord notifications when a target crosses a threshold
+- Calendar feed (`expiries.ics`) you can subscribe to
+- JSON status feed and SVG badges for your own pages or READMEs
+
+## Quick start
+
+You need Docker.
 
 ```bash
-# 1. Review targets. This file is the only configuration and is mounted read-only.
-$EDITOR certiwatch.toml
-
-# 2. Build and start one container.
-docker compose up -d --build
-
-# 3. Watch the first run and the probes.
-docker compose logs -f certiwatch
-curl -fsS http://127.0.0.1:8080/healthz
-curl -fsS http://127.0.0.1:8080/readyz
+docker run -d --name certiwatch \
+  -p 8080:8080 \
+  -v certiwatch-data:/data \
+  --restart unless-stopped \
+  ghcr.io/nooblk-98/certiwatch:latest
 ```
 
-Open <http://127.0.0.1:8080/>. The first check can take a while for many
-targets; `/readyz` answers `503` until the first snapshot is published.
-`docker compose down` stops the service; data stays in the `certiwatch-data`
-volume.
+Open <http://localhost:8080>. The first check takes a moment; the dashboard
+fills in as soon as it finishes. The image ships with a small example
+configuration so you can see it working straight away.
 
-To change the port: `CERTIWATCH_PORT=9090 docker compose up -d`.
+### Monitor your own sites
 
-Published releases are available from GHCR, tagged with the version (no `v`):
+1. Create a `certiwatch.toml` (see [Configuration](#configuration)).
+2. Mount it into the container:
 
 ```bash
-docker run --rm -p 8080:8080 \
+docker run -d --name certiwatch \
+  -p 8080:8080 \
   -v "$PWD/certiwatch.toml:/config/certiwatch.toml:ro" \
   -v certiwatch-data:/data \
-  ghcr.io/nooblk-98/certiwatch:2.0.1
+  --restart unless-stopped \
+  ghcr.io/nooblk-98/certiwatch:latest
 ```
 
-### Compose contract
+### Docker Compose and Portainer
 
-| Item | Value |
-| --- | --- |
-| Service | `certiwatch` (one container, no sidecars) |
-| Image user | `10001:10001`, non-root |
-| Root filesystem | read-only, `/tmp` tmpfs |
-| Config | `./certiwatch.toml` mounted at `/config/certiwatch.toml:ro` |
-| Persistent data | named volume `certiwatch-data` at `/data` |
-| Capabilities | all dropped, `no-new-privileges` |
-| Healthcheck | `curl -fsS http://127.0.0.1:8080/healthz` |
-| Stop | `SIGTERM`, 30 s grace period |
+The repository includes a ready-to-use [`compose.yaml`](compose.yaml). Deploy it
+as a stack or run `docker compose up -d`. Set `CERTIWATCH_PORT` to change the
+port and `CERTIWATCH_TAG` to pin a version, for example `2.2.0`.
 
-## Native build
-
-Rust 1.88 or newer, a C toolchain, OpenSSL development headers and `pkg-config`:
-
-```bash
-cargo build --release --locked
-./target/release/certiwatch validate --config certiwatch.toml
-./target/release/certiwatch serve --config certiwatch.toml --data-dir ./data
-```
-
-Run one check without starting the server:
-
-```bash
-./target/release/certiwatch check --config certiwatch.toml --data-dir ./data
-```
-
-`check` exits `0` when the run published, `2` when it published with a delivery
-error, and `1` when it failed (the previous snapshot is kept).
+To use your own targets with Compose, uncomment the `certiwatch.toml` volume in
+`compose.yaml` and point it at an **absolute** path on the host.
 
 ## Configuration
 
-`certiwatch.toml` is validated against `schema/certiwatch.schema.json`. Unknown
-keys are rejected so a typo cannot silently disable a check. `owner` and `notes`
-stay local and are never copied to results, history, feeds or Discord.
+Targets live in one file, `certiwatch.toml`. Edits are picked up on the next
+check, with no restart needed.
 
 ```toml
 version = 1
 
 [defaults]
-ssl_port = 443
-thresholds = [30, 14, 7, 1]
-history_limit = 365
-check_dns = true
-check_hsts = true
-check_legacy_tls = false
-
-[alerts]
-discord = false          # webhook comes from CERTIWATCH_DISCORD_WEBHOOK
+thresholds = [30, 14, 7, 1]   # alert when this many days are left
 
 [[targets]]
-domain = "example.com"   # host, host:port or URL
-registration = true
+domain = "example.com"
+registration = true            # also watch the domain registration
 tags = ["public", "core"]
 group = "corporate"
-owner = "ops@example.com"
-notes = "Primary site."
 
 [[targets]]
 domain = "mail.example.com:587"
 tls_mode = "starttls"
 starttls_protocol = "smtp"
-https = false
 ```
 
-Per-target overrides: `ssl`, `ssl_port`, `registration`, `tls_mode`,
-`starttls_protocol`, `https`, `dns_name`, `check_dns`, `check_hsts`,
-`check_legacy_tls`.
+A target can be a host, `host:port` or a URL. `owner` and `notes` fields stay
+private: they are never shown in the dashboard or sent anywhere. Do not put
+secrets in this file.
 
-The service reads the file at startup and on every refresh, so target edits are
-picked up on the next run without a restart. It never writes to the file.
+### Settings
 
-### Environment variables
+Set these as environment variables on the container.
 
-| Variable | Default | Purpose |
+| Variable | Default | What it does |
 | --- | --- | --- |
-| `CERTIWATCH_CONFIG` | `./certiwatch.toml` | Configuration path |
-| `CERTIWATCH_DATA_DIR` | `./data` | Persistent generation store and run state |
-| `CERTIWATCH_LISTEN` | `0.0.0.0:8080` | HTTP listen address |
-| `CERTIWATCH_REFRESH_INTERVAL` | `3600` | Seconds between scheduled runs |
-| `CERTIWATCH_RUN_ON_START` | `1` | Run once at startup (`0`/`false` disables) |
-| `CERTIWATCH_RUN_TIMEOUT` | `900` | Overall run deadline, seconds |
-| `CERTIWATCH_MAX_CONCURRENCY` | `4` | Parallel checks per run |
-| `SSL_CHECK_TIMEOUT` | `15` | Per-connection timeout in seconds; finite positive values up to 86400, otherwise the default |
+| `CERTIWATCH_REFRESH_INTERVAL` | `3600` | Seconds between checks |
+| `CERTIWATCH_RUN_ON_START` | `1` | Check once at startup |
+| `CERTIWATCH_MAX_CONCURRENCY` | `4` | Parallel checks |
+| `SSL_CHECK_TIMEOUT` | `15` | Seconds to wait per connection |
 | `SSL_CA_FILE` | unset | Extra CA bundle for private CAs |
-| `CERTIWATCH_DISCORD_WEBHOOK` | unset | Discord webhook; never logged or stored |
+| `CERTIWATCH_DISCORD_WEBHOOK` | unset | Discord webhook URL for alerts |
 
-## Releases
+## Alerts
 
-`.github/workflows/release-publish.yml` is the only workflow. It runs when a
-**published** GitHub release named `vMAJOR.MINOR.PATCH` is created (never on a
-branch, pull request, draft or prerelease) and:
+To get Discord alerts, turn them on in `certiwatch.toml`:
 
-1. checks out the release tag and rejects a tag that is not exactly
-   `vMAJOR.MINOR.PATCH`;
-2. requires `Cargo.toml`'s version to equal the release version;
-3. requires the checked-out commit to be an ancestor of `main`;
-4. pushes one image, `ghcr.io/nooblk-98/certiwatch:<MAJOR.MINOR.PATCH>`, and
-   records its `sha256` digest in the run summary.
-
-It does not create releases, deploy the service, or push `latest`. Repository
-`contents` are read-only for the job; only the publish step receives
-`packages: write`. Actions are pinned to commit SHAs.
-
-## Data, backup and restore
-
-```
-/data
-├── current.json               # convenience pointer; records are authoritative
-├── commits/
-│   └── <id>.json              # durable commit evidence for each generation
-├── generations/
-│   └── <id>/
-│       ├── public/            # served; safe to back up
-│       │   ├── ssl_results.json
-│       │   ├── domain_results.json
-│       │   ├── history.json
-│       │   ├── status.json
-│       │   ├── expiries.ics
-│       │   └── badges/
-│       ├── private/           # 0700; never served
-│       │   └── alert_state.json
-│       └── .complete.json     # manifest of the committed generation
-├── public/                    # legacy tree, copied into a generation once
-└── private/last_run.json      # latest run summary
+```toml
+[alerts]
+discord = true
 ```
 
-Back up the whole volume; the committed `generations/` directories,
-`commits/` records and `current.json` are what prevent duplicate alerts after a
-restart. Recovery fails closed on incomplete record I/O, while readable
-invalid records suppress migration and allow fallback to an older verified
-generation. Record IDs come only from strict filenames and must match the
-payload. Retention counts only recovery-eligible generations, protects the
-current one, and preserves unknown or unverifiable evidence; records are
-removed only after a generation directory is removed. Snapshot example:
+Then pass the webhook URL as `CERTIWATCH_DISCORD_WEBHOOK`. The URL is read from
+the environment only; it is never stored or logged.
 
-```bash
-docker run --rm -v certiwatch-data:/data -v "$PWD/backup:/backup" \
-  alpine tar czf /backup/certiwatch-$(date +%F).tgz -C /data .
-```
+## Feeds and badges
 
-Restore into a new volume, then start the service. Certificate history is a
-single writer: run exactly one CertiWatch container against a volume.
+| Path | What you get |
+| --- | --- |
+| `/status.json` | Summary of current status for scripts and widgets |
+| `/expiries.ics` | Renewal calendar to subscribe to in your calendar app |
+| `/badges/` | SVG badges for status and expiry |
+| `/ssl_results.json`, `/domain_results.json` | Full latest results |
+| `/healthz`, `/readyz` | Health checks for your orchestrator |
 
-## Operations
+## FAQ
 
-- **Health:** `/healthz` proves the process is up. `/readyz` is `200` only after
-  a complete, coherent generation is committed, `503` with `Retry-After: 30`
-  before that. See [publication and egress hardening](docs/security-hardening.md).
-- **Refresh:** scheduled every `CERTIWATCH_REFRESH_INTERVAL` seconds, plus one
-  startup run unless disabled. There is no HTTP refresh endpoint.
-- **Logs:** one line per run (trigger, row counts, events, duration, whether the
-  snapshot was published) and one at shutdown. Secrets are never logged.
-- **Graceful stop:** `SIGTERM` stops accepting connections, lets the scheduler
-  finish within 10 s, and exits. Compose allows 30 s.
-- **Upgrade:** `docker compose build --pull && docker compose up -d`. The volume
-  and config are untouched.
-- **Rollback:** start the previous image tag against the same volume and config.
-  Generations are committed atomically, but an image older than this layout
-  reads only the legacy `public/` tree, so back up the volume before downgrading
-  across the layout change.
-- **Failure:** a run that cannot read any certificate, or cannot build a feed,
-  does not publish. The dashboard keeps showing the last good snapshot and marks
-  stale data after 36 hours.
+**Does it need a database?** No. Results and history are kept as files on one volume.
 
-## Security posture
+**How do I back it up?** Back up the `/data` volume. That holds history and alert state.
 
-- Non-root container, read-only root filesystem, all capabilities dropped.
-- `certiwatch.toml` is mounted read-only; no secrets belong in it.
-- Private state is `0700` and never routed.
-- Security headers: `nosniff`, `no-referrer`, `X-Frame-Options: DENY`, and a CSP
-  with `default-src 'none'`, no scripts, inline styles only (the embedded
-  stylesheet) and `form-action 'self'` for the dashboard filters.
-- Discord mentions are neutralised (`allowed_mentions: {"parse": []}`).
+**How do I update?** Pull the new image and recreate the container, for example `docker compose pull && docker compose up -d`. Your data and configuration are untouched.
 
-## From the original CertiWatch
+**Can I run two copies against the same volume?** No. Use exactly one container per data volume.
 
-The project began as scheduled certificate and domain checks that published a
-static dashboard. Version 2 brings the checks, schedule, storage, dashboard and
-feeds together in one self-hosted Rust service. The migration matched 1,411
-recorded legacy cases using [rust-anything](https://github.com/erkamyaman/rust-anything).
-See the [migration notes](docs/migration.md) for scope and verification limits.
+**Can I trigger a check from the dashboard?** No. The dashboard is read-only on purpose. Checks run on the schedule (default hourly).
 
-## Contributions welcome
+**Is revocation (OCSP/CRL) checked?** Not at the moment.
 
-Bug reports, feature suggestions and pull requests are welcome. For a bug,
-include your version, deployment method and a minimal example with credentials
-and private target names removed.
+**What if a check fails?** CertiWatch keeps showing the last good results and marks the data as stale after 36 hours.
 
-Before opening a PR, run:
+## Security
 
-```bash
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-docker compose build
-```
+The container runs as a non-root user with a read-only filesystem and no extra
+privileges. The dashboard sends no scripts to your browser, the configuration is
+mounted read-only, and private alert state is never served. More detail in
+[security hardening](docs/security-hardening.md).
 
-## Live protocol gaps
+## Documentation
 
-Operational limits:
-
-- **No operator API.** Refreshes are scheduled or CLI-only. A misconfigured
-  container is fixed with config + restart/next run, not a remote action.
-- **One writer per data volume.** There is no distributed lock or leader
-  election; two containers sharing `/data` can interleave publications.
-- **No config hot reload of operational settings.** `certiwatch.toml` targets are
-  re-read on each run, but listen address, data dir, interval and timeouts need a
-  restart.
-- **Outbound network required.** DNS, TLS, RDAP/WHOIS and Discord are not
-  mirrored offline. Live service behaviour (including rate limits) is verified
-  through offline test fixtures during the migration.
-- **Revocation:** OCSP/CRL checking is not implemented and is not claimed.
-- **DNS semantics:** records are what the host resolver returned; DNSSEC is
-  "validated" only when the resolver sets the AD bit.
-- **Discord is the only alert transport.** Delivery is at-least-once with a
-  durable batch; ordering across runs is not guaranteed.
-- **UTC.** All timestamps are UTC; the dashboard formats dates for display.
-- **History is daily.** Multiple runs on the same day replace that day's
-  snapshot.
-- **Release images.** Publishing a GitHub release builds the versioned GHCR image.
-  The running service handles monitoring and scheduling independently.
+- [HTTP API](docs/http-api.md)
+- [Security hardening](docs/security-hardening.md)
+- [Development and operations notes](docs/development.md): building from source, architecture, releases, contributing
 
 ## License
 
-MIT.
+MIT

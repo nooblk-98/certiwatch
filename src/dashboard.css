@@ -2318,3 +2318,226 @@ tr.row:has(details[open]) td {
 .foot-name { color: var(--muted); }
 .foot-version { color: var(--ink-2); font-weight: 600; }
 .foot-repo { display: inline-flex; align-items: center; gap: 6px; }
+
+/* ── Polish pass: groups, filters, radar links, calendar, stale ──────────── */
+
+/* Urgency groups */
+.group-row th {
+  padding: 14px 10px 6px;
+  border-bottom: 1px solid var(--line-strong);
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  text-align: left;
+  color: var(--muted);
+}
+
+.group-0 th { color: var(--bad); }
+.group-1 th { color: var(--warn); }
+.group-2 th { color: var(--live); }
+.group-count {
+  margin-left: 8px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--ink-2);
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.group-toggle {
+  float: right;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+/* Row left edge by urgency */
+tr.row th:first-child { box-shadow: inset 3px 0 0 transparent; }
+tr.row-act th:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+tr.row-soon th:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+
+/* Compact filters */
+.filters { align-items: end; }
+
+.more-filters { position: relative; align-self: end; }
+
+.more-filters > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--soft);
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  list-style: none;
+  cursor: pointer;
+}
+
+.more-filters > summary::-webkit-details-marker { display: none; }
+.more-filters[open] > summary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+
+.filter-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 10px;
+  text-align: center;
+}
+
+.more-panel {
+  position: absolute;
+  z-index: 15;
+  top: calc(100% + 6px);
+  left: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(150px, 1fr));
+  gap: 10px;
+  width: min(380px, 80vw);
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: var(--shadow-pop);
+}
+
+/* Radar bars that filter the table */
+a.rcol.is-link { color: inherit; text-decoration: none; cursor: pointer; }
+a.rcol.is-link:hover .rbar { filter: brightness(1.2); }
+a.rcol.is-link:hover .rlabel { color: var(--ink); }
+
+/* 30-day renewal calendar */
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cal-day {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--soft);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.cal-day.is-today { box-shadow: 0 0 0 1.5px var(--accent); color: var(--ink); }
+.cal-day.has-warm { background: color-mix(in srgb, var(--warn) 22%, var(--card)); border-color: var(--warn); color: var(--warn-ink); font-weight: 700; }
+.cal-day.has-hot { background: color-mix(in srgb, var(--bad) 22%, var(--card)); border-color: var(--bad); color: var(--bad-ink); font-weight: 700; }
+.cal-count {
+  position: absolute;
+  top: -5px;
+  right: -4px;
+  min-width: 13px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--page);
+  font-size: 9px;
+  line-height: 13px;
+  text-align: center;
+}
+
+/* All-clear and stale states */
+.empty-ok { color: var(--live); font-family: var(--mono); font-size: 12px; }
+
+.banner-stale {
+  padding: 1px 8px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  color: var(--warn-ink);
+}
+
+.cc-grid.is-stale .cc-primary,
+.cc-grid.is-stale .cc-side { opacity: 0.82; }
+
+/* Sticky table header on wide screens */
+@media (min-width: 1000px) {
+  .table-scroll { overflow: visible; }
+  thead th {
+    position: sticky;
+    top: 61px;
+    z-index: 6;
+    background: var(--card);
+  }
+}
+
+.rank-name { font-family: var(--mono); font-size: 12px; }
+
+@media (max-width: 760px) {
+  .more-panel { grid-template-columns: minmax(0, 1fr); }
+  .group-row th { padding-left: 0; }
+}
+
+/* Icon-only details toggle keeps the table inside its card */
+.col-toggle, .cell-toggle { min-width: 0; width: 44px; padding-right: 6px; }
+.cell-toggle details > summary { width: 32px; justify-content: center; padding: 0; }
+.cell-toggle .summary-word { display: none; }
+
+.brand, .brand-name { flex: none; white-space: nowrap; }
+
+@media (max-width: 760px) {
+  .top-inner { flex-wrap: wrap; row-gap: 8px; padding-top: 8px; padding-bottom: 8px; }
+  .toolbar { flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+  .cell-toggle details > summary { width: auto; padding: 0 10px; }
+  .cell-toggle .summary-word { display: inline; }
+}
+
+/* QA: keep the filters popover inside the viewport */
+.filters { position: relative; }
+.more-filters { position: static; }
+.more-panel { top: calc(100% - 6px); left: auto; right: 0; }
+@media (max-width: 760px) { .more-panel { left: 0; right: 0; width: auto; } }
+
+/* QA: contrast fixes (light theme uses the darker *-ink tokens for text) */
+.tab-count, .pill-count { color: var(--ink); }
+.group-0 th { color: var(--bad-ink); }
+.group-1 th { color: var(--warn-ink); }
+.group-2 th { color: var(--ok-ink); }
+.fresh-live { color: var(--ok-ink); }
+.kpi-value { color: var(--kpi-ink, var(--kpi-hue, var(--ink))); }
+.kpi-warm, .kpi-hot { --kpi-ink: var(--warn-ink); }
+.kpi-bad { --kpi-ink: var(--bad-ink); }
+.kpi:first-child { --kpi-ink: var(--ok-ink); }
+.kpi:last-child { --kpi-ink: var(--accent); }
+.kpi-warm .kpi-value, .kpi-hot .kpi-value, .kpi-bad .kpi-value { color: var(--kpi-ink); }
+
+/* QA: 761-1179px tables drop the issuer column instead of scrolling sideways */
+@media (min-width: 761px) and (max-width: 1179px) {
+  .col-provider, .cell-provider { display: none; }
+}
+.tab.is-on .tab-count, .pill.is-on .pill-count { color: var(--ink); }
+
+/* QA: keep the wide table inside its card */
+.col-domain { min-width: 150px; }
+.days-track { width: 72px; }
+.cell-provider > span { max-width: 150px; }
+tbody th, tbody td { padding-left: 8px; padding-right: 8px; }
+.col-domain { min-width: 200px; }
+.days-track { width: 56px; }
+.cell-provider > span { max-width: 130px; }
+
+/* QA: tablet header and calendar sizing */
+@media (max-width: 900px) {
+  .top-inner { flex-wrap: wrap; row-gap: 8px; }
+  .tabs { flex: none; }
+}
+.cal-grid { max-width: 520px; margin-inline: auto; }

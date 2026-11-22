@@ -162,6 +162,9 @@ pub struct DashboardQuery {
     /// `light` or `dark`. Never part of generated links: the server remembers it in a cookie.
     #[serde(default)]
     pub theme: String,
+    /// `1` shows the healthy group that the urgency view collapses by default.
+    #[serde(default)]
+    pub healthy: String,
 }
 
 fn lenient<'de, D, T>(de: D) -> Result<T, D::Error>
@@ -215,6 +218,9 @@ impl DashboardQuery {
         }
         if !self.open.is_empty() {
             pairs.push(("open", self.open.clone()));
+        }
+        if self.healthy == "1" {
+            pairs.push(("healthy", "1".to_string()));
         }
         if pairs.is_empty() {
             return "?".to_string();
@@ -1612,13 +1618,75 @@ impl Page {
         self.render_notes(out, payload);
         self.render_banner(out);
         self.render_kpis(out, payload);
-        out.push_str("<div class=\"cc-grid\"><div class=\"cc-primary\">");
+        let stale = freshness(self.generated_at(self.q.tab), self.now).0 == Freshness::Old;
+        let _ = write!(
+            out,
+            "<div class=\"cc-grid{}\"><div class=\"cc-primary\">",
+            if stale { " is-stale" } else { "" }
+        );
         self.render_list(out, payload);
         out.push_str("</div><aside class=\"cc-side\" aria-label=\"Overview\">");
         self.render_timeline(out);
-        self.render_attention(out);
+        self.render_calendar(out);
         self.render_distribution(out, payload);
         out.push_str("</aside></div>");
+    }
+
+    fn render_calendar(&self, out: &mut String) {
+        let rows = self.rows(self.q.tab);
+        let today = self.now.div_euclid(86_400);
+        let mut due = 0usize;
+        out.push_str("<section class=\"card calendar\" aria-labelledby=\"cal-title\">");
+        let mut cells = String::new();
+        for offset in 0..30i64 {
+            let (_, month, day) = civil_from_days(today + offset);
+            let hits: Vec<&Row> = rows.iter().filter(|row| row.days == Some(offset)).collect();
+            due += hits.len();
+            let hot = hits.iter().any(|row| matches!(row.cat, Cat::Today | Cat::Urgent))
+                || (offset <= 7 && !hits.is_empty());
+            let names = hits
+                .iter()
+                .map(|row| row.domain.as_str())
+                .collect::<Vec<&str>>()
+                .join(", ");
+            let _ = write!(
+                cells,
+                "<li class=\"cal-day{}{}\"{}><span class=\"cal-num\" aria-hidden=\"true\">{}</span>{}</li>",
+                if offset == 0 { " is-today" } else { "" },
+                if hits.is_empty() {
+                    ""
+                } else if hot {
+                    " has-hot"
+                } else {
+                    " has-warm"
+                },
+                if hits.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " title=\"{} {} · {}\" aria-label=\"{} {}: {}\"",
+                        day,
+                        month_name(month),
+                        esc(&names),
+                        day,
+                        month_name(month),
+                        esc(&names)
+                    )
+                },
+                day,
+                if hits.is_empty() {
+                    String::new()
+                } else {
+                    format!("<span class=\"cal-count\" aria-hidden=\"true\">{}</span>", hits.len())
+                }
+            );
+        }
+        let _ = write!(
+            out,
+            "<div class=\"card-head\"><h2 id=\"cal-title\">Next 30 days</h2><p class=\"card-fact\">{} expiring</p></div><ol class=\"cal-grid\">{}</ol>",
+            due, cells
+        );
+        out.push_str("</section>");
     }
 
     fn render_banner(&self, out: &mut String) {
@@ -1649,14 +1717,24 @@ impl Page {
         } else {
             ("ok", "ALL CLEAR", format!("{} monitored", rows.len()))
         };
+        let (fresh, age) = freshness(self.generated_at(self.q.tab), self.now);
+        let stale = if fresh == Freshness::Old {
+            format!(
+                "<span class=\"banner-stale\">Data {} old</span>",
+                span_text(age.unwrap_or(0))
+            )
+        } else {
+            String::new()
+        };
         let _ = write!(
             out,
             "<div class=\"banner banner-{}\" role=\"status\"><span class=\"banner-led\" aria-hidden=\"true\"></span>\
-             <strong>{}</strong><span class=\"banner-detail\">{}</span>\
+             <strong>{}</strong><span class=\"banner-detail\">{}</span>{}\
              <a class=\"banner-link\" href=\"#inventory\">Inventory <span aria-hidden=\"true\">↓</span></a></div>",
             tone,
             head,
-            esc(&detail)
+            esc(&detail),
+            stale
         );
     }
 
@@ -1860,12 +1938,20 @@ impl Page {
                 .filter_map(|row| row.days)
                 .filter(|days| *days > 30)
                 .min();
-            out.push_str("<p class=\"empty-state\">Nothing expires within 30 days.</p>");
+            out.push_str("<p class=\"empty-state empty-ok\"><span aria-hidden=\"true\">✓</span> All clear: nothing expires within 30 days.</p>");
             if let Some(days) = next {
+                let who = self
+                    .rows(tab)
+                    .iter()
+                    .filter(|row| row.days == Some(days))
+                    .map(|row| row.domain.clone())
+                    .next()
+                    .unwrap_or_default();
                 let _ = write!(
                     out,
-                    "<p class=\"empty-meta\">Next expiry in <strong>{} d</strong></p>",
-                    days
+                    "<p class=\"empty-meta\">Next expiry in <strong>{} d</strong> · {}</p>",
+                    days,
+                    esc(&who)
                 );
             }
         } else {
@@ -1971,14 +2057,38 @@ impl Page {
             } else {
                 (*count as f64 / peak as f64 * 100.0).max(8.0)
             };
+            let filter = match index {
+                0 => Some(StatusFilter::Expired),
+                1 => Some(StatusFilter::Urgent),
+                2 => Some(StatusFilter::Soon),
+                _ => None,
+            };
+            let (open_tag, close_tag) = match filter {
+                Some(filter) if *count > 0 => {
+                    let href = self.q.apply(|next| {
+                        next.status = filter;
+                        next.open.clear();
+                        next.healthy.clear();
+                    });
+                    (
+                        format!(
+                            "<a class=\"rcol is-link{}\" href=\"{}#inventory\" title=\"Show {} in the table\">",
+                            if *count == 0 { " is-zero" } else { "" },
+                            esc(&href),
+                            esc(labels[index])
+                        ),
+                        "</a>",
+                    )
+                }
+                _ => (
+                    format!("<div class=\"rcol{}\">", if *count == 0 { " is-zero" } else { "" }),
+                    "</div>",
+                ),
+            };
             let _ = write!(
                 out,
-                "<div class=\"rcol{}\"><span class=\"rcount\">{}</span><span class=\"rbar {}\" style=\"height:{:.1}%\"></span><span class=\"rlabel\">{}</span></div>",
-                if *count == 0 { " is-zero" } else { "" },
-                count,
-                classes[index],
-                height,
-                short[index]
+                "{}<span class=\"rcount\">{}</span><span class=\"rbar {}\" style=\"height:{:.1}%\"></span><span class=\"rlabel\">{}</span>{}",
+                open_tag, count, classes[index], height, short[index], close_tag
             );
         }
         out.push_str("</div>");
@@ -2024,6 +2134,7 @@ impl Page {
 
     fn render_controls(&self, out: &mut String, counts: Counts) {
         let tab = self.q.tab;
+        self.render_pills(out, counts);
         out.push_str(
             "<form class=\"filters\" method=\"get\" action=\"#inventory\" role=\"search\">",
         );
@@ -2039,6 +2150,9 @@ impl Page {
                 status_param(self.q.status)
             );
         }
+        if self.q.healthy == "1" {
+            out.push_str("<input type=\"hidden\" name=\"healthy\" value=\"1\">");
+        }
         out.push_str("<div class=\"field field-grow\"><label for=\"q\">Search</label>");
         let _ = write!(
             out,
@@ -2047,6 +2161,20 @@ impl Page {
             if tab == DashboardTab::Ssl { "issuer" } else { "registrar" }
         );
         out.push_str("</div>");
+        let active_filters = usize::from(!self.q.group.is_empty())
+            + usize::from(!self.q.tag.is_empty())
+            + usize::from(self.q.sort != SortKey::Attention)
+            + usize::from(self.q.dir != SortDir::Asc);
+        let _ = write!(
+            out,
+            "<details class=\"more-filters\"{}><summary>Filters{}</summary><div class=\"more-panel\">",
+            if active_filters > 0 { " open" } else { "" },
+            if active_filters > 0 {
+                format!("<span class=\"filter-count\">{active_filters}</span>")
+            } else {
+                String::new()
+            }
+        );
         self.render_select(
             out,
             "group",
@@ -2082,7 +2210,7 @@ impl Page {
                 label
             );
         }
-        out.push_str("</select></div><div class=\"field field-actions\">");
+        out.push_str("</select></div></div></details><div class=\"field field-actions\">");
         out.push_str("<button class=\"button\" type=\"submit\">Apply</button>");
         let clear = self.q.apply(|next| {
             next.status = StatusFilter::All;
@@ -2096,6 +2224,10 @@ impl Page {
             "<a class=\"button button-ghost\" href=\"{}#inventory\">Clear</a></div></form>",
             esc(&clear)
         );
+    }
+
+    fn render_pills(&self, out: &mut String, counts: Counts) {
+        let tab = self.q.tab;
         out.push_str("<nav class=\"pills\" aria-label=\"Filter by status\">");
         for (filter, label, count, name) in [
             (StatusFilter::All, "All", counts.all, "all"),
@@ -2217,7 +2349,61 @@ impl Page {
         out.push_str("<th scope=\"col\" class=\"col-expires\">Expires</th>");
         out.push_str("<th scope=\"col\" class=\"col-toggle\"><span class=\"sr-only\">Details</span></th>");
         out.push_str("</tr></thead><tbody>");
+        let grouped = self.q.sort == SortKey::Attention && self.q.dir == SortDir::Asc;
+        let has_problem = rows.iter().any(|row| row.cat.is_problem());
+        let plain = self.q.status == StatusFilter::All
+            && self.q.q.is_empty()
+            && self.q.group.is_empty()
+            && self.q.tag.is_empty();
+        let wants_healthy_row = rows
+            .iter()
+            .any(|row| !row.cat.is_problem() && self.row_open(row));
+        let collapse = grouped
+            && plain
+            && has_problem
+            && self.q.healthy != "1"
+            && !wants_healthy_row;
+        let mut current: Option<u8> = None;
+        // Keep each urgency group contiguous: unreachable targets belong to "Act now".
+        let mut ordered: Vec<&Row> = rows.to_vec();
+        if grouped {
+            ordered.sort_by_key(|row| row_group(row.cat).0);
+        }
+        let rows = ordered.as_slice();
         for (index, row) in rows.iter().enumerate() {
+            if grouped && has_problem {
+                let (rank, label) = row_group(row.cat);
+                if current != Some(rank) {
+                    current = Some(rank);
+                    let count = rows.iter().filter(|r| row_group(r.cat).0 == rank).count();
+                    let toggle = if rank == 2 && plain {
+                        if collapse {
+                            let href = self.q.apply(|next| next.healthy = "1".to_string());
+                            format!(
+                                "<a class=\"group-toggle\" href=\"{}#inventory\">Show {} <span aria-hidden=\"true\">▾</span></a>",
+                                esc(&href),
+                                count
+                            )
+                        } else {
+                            let href = self.q.apply(|next| next.healthy.clear());
+                            format!(
+                                "<a class=\"group-toggle\" href=\"{}#inventory\">Hide <span aria-hidden=\"true\">▴</span></a>",
+                                esc(&href)
+                            )
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let _ = write!(
+                        out,
+                        "<tr class=\"group-row group-{}\"><th scope=\"colgroup\" colspan=\"6\"><span class=\"group-name\">{}</span><span class=\"group-count\">{}</span>{}</th></tr>",
+                        rank, label, count, toggle
+                    );
+                }
+                if collapse && rank == 2 {
+                    continue;
+                }
+            }
             self.render_row(out, row, index);
         }
         out.push_str("</tbody></table></div>");
@@ -2295,7 +2481,15 @@ impl Page {
         let tab = self.q.tab;
         let open = self.row_open(row);
         let detail_id = format!("{}-{index}", stable_id(&row.key));
-        out.push_str("<tr class=\"row\">");
+        let _ = write!(
+            out,
+            "<tr class=\"row row-{}\">",
+            match row_group(row.cat).0 {
+                0 => "act",
+                1 => "soon",
+                _ => "ok",
+            }
+        );
         let _ = write!(
             out,
             "<th scope=\"row\" class=\"cell-domain\" data-label=\"Domain\">{}</th>",
@@ -2345,7 +2539,7 @@ impl Page {
         );
         let _ = write!(
             out,
-            "<td class=\"cell-toggle\"><details{}><summary><span class=\"chev\" aria-hidden=\"true\"></span>\
+            "<td class=\"cell-toggle\"><details{}><summary title=\"Details\"><span class=\"chev\" aria-hidden=\"true\"></span>\
              <span class=\"summary-word\" aria-hidden=\"true\">Details</span>\
              <span class=\"sr-only\">Details for {}</span></summary></details></td></tr>",
             if open { " open" } else { "" },
@@ -2996,6 +3190,23 @@ impl Row {
             self.not_after.clone()
         }
     }
+}
+
+fn row_group(cat: Cat) -> (u8, &'static str) {
+    match cat {
+        Cat::Expired | Cat::Today | Cat::Urgent | Cat::Error | Cat::Invalid | Cat::Unknown => {
+            (0, "Act now")
+        }
+        Cat::Warn => (1, "This month"),
+        Cat::Ok => (2, "Healthy"),
+    }
+}
+
+fn month_name(month: i64) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    NAMES[(month.clamp(1, 12) - 1) as usize]
 }
 
 fn non_empty<'a>(value: &'a str, fallback: &'a str) -> &'a str {
