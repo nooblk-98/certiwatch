@@ -83,7 +83,7 @@ Published releases are available from GHCR, tagged with the version (no `v`):
 docker run --rm -p 8080:8080 \
   -v "$PWD/certiwatch.toml:/config/certiwatch.toml:ro" \
   -v certiwatch-data:/data \
-  ghcr.io/nooblk-98/certiwatch:2.0.0
+  ghcr.io/nooblk-98/certiwatch:2.0.1
 ```
 
 ### Compose contract
