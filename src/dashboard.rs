@@ -1579,7 +1579,7 @@ impl Page {
         let _ = write!(
             out,
             "<div class=\"page-head\"><h1>{}</h1>\
-             <a class=\"button button-ghost\" href=\"#inventory\">Browse results <span aria-hidden=\"true\">↓</span></a></div>",
+             <a class=\"inventory-link\" href=\"#inventory\">Jump to results <span aria-hidden=\"true\">↓</span></a></div>",
             if self.q.tab == DashboardTab::Ssl {
                 "Certificate monitoring"
             } else {
