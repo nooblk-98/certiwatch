@@ -1,6 +1,7 @@
 # CertiWatch single-container deployment.
 #
-# certiwatch.toml is the only configuration and is mounted read-only.
+# A default certiwatch.toml is baked into the image. To use your own, uncomment the
+# bind mount below (needs an absolute host path under Portainer).
 # Data lives in the named volume; the container root filesystem is read-only.
 
 services:
@@ -20,7 +21,7 @@ services:
       CERTIWATCH_RUN_ON_START: "${CERTIWATCH_RUN_ON_START:-1}"
       CERTIWATCH_DISCORD_WEBHOOK: "${CERTIWATCH_DISCORD_WEBHOOK:-}"
     volumes:
-      - ./certiwatch.toml:/config/certiwatch.toml:ro
+      # - ./certiwatch.toml:/config/certiwatch.toml:ro
       - certiwatch-data:/data
     read_only: true
     tmpfs:

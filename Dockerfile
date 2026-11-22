@@ -28,6 +28,9 @@ RUN apt-get update \
     && chown certiwatch:certiwatch /data
 
 COPY --from=build /src/target/release/certiwatch /usr/local/bin/certiwatch
+# Default config baked in so the container starts without a bind mount (e.g. Portainer
+# stacks, where ./certiwatch.toml does not exist on the host). Mount over it to customise.
+COPY certiwatch.toml /config/certiwatch.toml
 
 WORKDIR /app
 
