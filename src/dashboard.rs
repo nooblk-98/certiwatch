@@ -1415,14 +1415,13 @@ impl Page {
         out.push_str("<body>");
         out.push_str("<a class=\"skip\" href=\"#main\">Skip to results</a>");
         self.render_header(&mut out);
-        out.push_str("<main id=\"main\" class=\"wrap main\">");
+        out.push_str("<main id=\"main\" class=\"wrap main\" tabindex=\"-1\">");
         if matches!(self.ssl, Load::Missing) && matches!(self.domains, Load::Missing) {
             self.render_setup(&mut out);
         } else if let Load::Ready(payload) = self.load(self.q.tab) {
             if payload.rows.is_empty() {
                 self.render_empty(&mut out);
             } else {
-                out.push_str("<h1 class=\"sr-only\">CertiWatch certificate and domain expiry</h1>");
                 self.render_active(&mut out, payload);
             }
         } else {
@@ -1456,7 +1455,7 @@ impl Page {
             "<div class=\"brand\"><svg class=\"brand-mark\" viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\">\
              <path d=\"M12 2.6 19 5.4v5.3c0 4.2-2.9 7.6-7 9.1-4.1-1.5-7-4.9-7-9.1V5.4L12 2.6Z\"/>\
              <path d=\"m8.6 11.6 2.3 2.3 4.5-4.7\"/></svg>\
-             <span class=\"brand-name\">CertiWatch</span><span class=\"brand-sub\">expiry monitor</span></div>",
+             <span class=\"brand-name\">CertiWatch</span></div>",
         );
         out.push_str("<nav class=\"tabs\" aria-label=\"Result type\">");
         for tab in [DashboardTab::Ssl, DashboardTab::Domains] {
@@ -1577,6 +1576,16 @@ impl Page {
     }
 
     fn render_active(&self, out: &mut String, payload: &Payload) {
+        let _ = write!(
+            out,
+            "<div class=\"page-head\"><h1>{}</h1>\
+             <a class=\"button button-ghost\" href=\"#inventory\">Browse results <span aria-hidden=\"true\">↓</span></a></div>",
+            if self.q.tab == DashboardTab::Ssl {
+                "Certificate monitoring"
+            } else {
+                "Domain monitoring"
+            }
+        );
         self.render_notes(out, payload);
         self.render_kpis(out, payload);
         out.push_str("<div class=\"grid-main\">");
@@ -1813,10 +1822,10 @@ impl Page {
                 });
                 let _ = write!(
                     out,
-                    "<li class=\"attn-item\"><a class=\"attn-link\" href=\"{}\">{}<span class=\"attn-domain\">{}</span><span class=\"attn-days\">{}</span></a></li>",
+                    "<li class=\"attn-item\"><a class=\"attn-link\" href=\"{}#inventory\"><span class=\"attn-domain\">{}</span>{}<span class=\"attn-days\">{}</span><span class=\"attn-arrow\" aria-hidden=\"true\">›</span></a></li>",
                     esc(&href),
-                    self.chip(row),
                     esc(&row.domain),
+                    self.chip(row),
                     esc(&self.days_text(row))
                 );
             }
@@ -1831,9 +1840,9 @@ impl Page {
                 });
                 let _ = write!(
                     out,
-                    "<a class=\"more-link\" href=\"{}\">+{} more</a>",
+                    "<a class=\"more-link\" href=\"{}#inventory\">View all {} needing attention <span aria-hidden=\"true\">→</span></a>",
                     esc(&more),
-                    rows.len() - 6
+                    rows.len()
                 );
             }
         }
@@ -1922,10 +1931,10 @@ impl Page {
         let rows = self.visible_rows();
         let total = payload.rows.len();
         let counts = self.scoped_counts();
-        out.push_str("<section class=\"card list-card\" aria-labelledby=\"list-title\">");
+        out.push_str("<section class=\"card list-card\" aria-labelledby=\"inventory\">");
         let _ = write!(
             out,
-            "<div class=\"card-head\"><div><h2 id=\"list-title\">{}</h2>\
+            "<div class=\"card-head\"><div><h2 id=\"inventory\" tabindex=\"-1\">{}</h2>\
              <p class=\"card-fact\">Showing {} of {} · {}</p></div>",
             tab.label(),
             rows.len(),
@@ -1945,7 +1954,7 @@ impl Page {
             });
             let _ = write!(
                 out,
-                "<a class=\"button button-ghost\" href=\"{}\">Clear filters</a></div>",
+                "<a class=\"button button-ghost\" href=\"{}#inventory\">Clear filters</a></div>",
                 esc(&clear)
             );
         } else {
@@ -1956,7 +1965,9 @@ impl Page {
 
     fn render_controls(&self, out: &mut String, counts: Counts) {
         let tab = self.q.tab;
-        out.push_str("<form class=\"filters\" method=\"get\" action=\"\" role=\"search\">");
+        out.push_str(
+            "<form class=\"filters\" method=\"get\" action=\"#inventory\" role=\"search\">",
+        );
         let _ = write!(
             out,
             "<input type=\"hidden\" name=\"tab\" value=\"{}\">",
@@ -2023,7 +2034,7 @@ impl Page {
         });
         let _ = write!(
             out,
-            "<a class=\"button button-ghost\" href=\"{}\">Clear</a></div></form>",
+            "<a class=\"button button-ghost\" href=\"{}#inventory\">Clear</a></div></form>",
             esc(&clear)
         );
         out.push_str("<nav class=\"pills\" aria-label=\"Filter by status\">");
@@ -2066,7 +2077,7 @@ impl Page {
             });
             let _ = write!(
                 out,
-                "<a class=\"pill{}\" href=\"{}\"{} data-filter=\"{}\">{}<span class=\"pill-count\">{}</span></a>",
+                "<a class=\"pill{}\" href=\"{}#inventory\"{} data-filter=\"{}\">{}<span class=\"pill-count\">{}</span></a>",
                 if active { " is-on" } else { "" },
                 esc(&href),
                 if active { " aria-current=\"true\"" } else { "" },
@@ -2188,7 +2199,7 @@ impl Page {
         });
         let _ = write!(
             out,
-            "<a class=\"sort-link{}\" href=\"{}\"{}>{}<span class=\"sort-arrow\" aria-hidden=\"true\">{}</span></a>",
+            "<a class=\"sort-link{}\" href=\"{}#inventory\"{}>{}<span class=\"sort-arrow\" aria-hidden=\"true\">{}</span></a>",
             if active { " is-on" } else { "" },
             esc(&href),
             if active {
